@@ -159,6 +159,8 @@ func (c *Coordinator) Done() bool {
 	ret := false
 
 	// Your code here.
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
 	if c.coordinatorState == exitTask {
 		ret = true
 		time.Sleep(time.Second)
