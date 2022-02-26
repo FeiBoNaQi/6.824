@@ -163,7 +163,6 @@ func (c *Coordinator) Done() bool {
 	defer c.mutex.Unlock()
 	if c.coordinatorState == exitTask {
 		ret = true
-		time.Sleep(time.Second)
 	}
 	return ret
 }
