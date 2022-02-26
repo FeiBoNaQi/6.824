@@ -53,7 +53,9 @@ func Worker(mapf func(string, string) []KeyValue,
 	}
 	for {
 		reply := CommunicateReply{}
-		call("Coordinator.Communicate", &args, &reply)
+		if !call("Coordinator.Communicate", &args, &reply) {
+			return
+		}
 		// fmt.Printf("reply.TaskNumber %v\n", reply.TaskNumber)
 		// fmt.Printf("reply.Location %v\n", reply.Location)
 		// fmt.Printf("reply.Task %v\n", reply.Task)
@@ -122,7 +124,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			sort.Sort(ByKey(kva))
 
 			oname := "mr-out-" + reply.Location
-			ofile, err := ioutil.TempFile(".", oname)
+			ofile, err := ioutil.TempFile(".", reply.Location)
 			if err != nil {
 				log.Fatalf("cannot create %v", oname)
 			}
