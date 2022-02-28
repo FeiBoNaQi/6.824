@@ -89,10 +89,11 @@ def main(
             # Multi column printing, timing is dropped to maximize horizontal
             # space. Heavylifting is done through rich.column.Columns object
             else:
-                cols = ["" for _ in range(n_columns)]
+                cols = ["" for _ in range(n_columns+1)]
                 msg = "" + msg
-                cols[i] = msg
-                col_width = int(width / n_columns)
+                cols[0] = "" + time
+                cols[i+1] = msg
+                col_width = int(width / (n_columns+1))
                 cols = Columns(cols, width=col_width - 1, equal=True, expand=True)
                 print(cols)
         except:

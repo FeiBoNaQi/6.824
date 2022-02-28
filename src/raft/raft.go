@@ -19,11 +19,15 @@ package raft
 
 import (
 	//	"bytes"
+
+	"math/rand"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	//	"6.824/labgob"
 	"6.824/labrpc"
+	"6.824/prettydebug"
 )
 
 //
@@ -62,7 +66,9 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
+	currentTerm int
+	votedFor    int
+	heartbeat   bool
 }
 
 // return currentTerm and whether this server
@@ -238,13 +244,21 @@ func (rf *Raft) killed() bool {
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
+	//protect rf.dead and rf.electionTimout
+	rf.mu.Lock()
 	for rf.killed() == false {
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-
+		if rf.heartbeat == false {
+			prettydebug.Debug(prettydebug.DTimer, "S%d Timer, election timeout", rf.me)
+		}
+		rf.mu.Unlock()
+		time.Sleep(time.Duration(300*rand.Float32()) * time.Millisecond)
+		rf.mu.Lock()
 	}
+	rf.mu.Unlock()
 }
 
 //
@@ -266,6 +280,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rand.Seed(time.Now().Unix())
+	rf.mu.Lock()
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.heartbeat = false
+	rf.mu.Unlock()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"6.824/prettydebug"
 )
 
 // The tester generously allows solutions to complete elections in one second
@@ -22,6 +24,7 @@ import (
 const RaftElectionTimeout = 1000 * time.Millisecond
 
 func TestInitialElection2A(t *testing.T) {
+	prettydebug.Init()
 	servers := 3
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
