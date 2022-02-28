@@ -254,6 +254,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.state = follower
 		reply.Success = true
 		reply.Term = args.Term
+		prettydebug.Debug(prettydebug.DInfo, "S%d is follower, leader: %d, term: %d", rf.me, args.LearderID, rf.currentTerm)
 	} else {
 		reply.Success = false
 		reply.Term = rf.currentTerm
@@ -311,6 +312,10 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+// to do
+// if the server is not selected as leader
+// the cond.Wait() will blocking forever
+// which wates resouces, check how many server rejected
 func (rf *Raft) runElection(electionTerm int) bool {
 	rf.mu.Lock()
 	length := len(rf.peers)
@@ -349,6 +354,7 @@ func (rf *Raft) runElection(electionTerm int) bool {
 								rf.votedFor = -1
 							}
 							rf.mu.Unlock()
+							cond.Signal()
 							return false
 						} else if replay.Term == t {
 							// peer's vote already gives to others
@@ -358,7 +364,8 @@ func (rf *Raft) runElection(electionTerm int) bool {
 						time.Sleep(backoff * 10 * time.Millisecond)
 						backoff = backoff * 2
 						if backoff > 16 {
-							return false
+							backoff = 16
+							cond.Signal()
 						}
 					}
 				}
@@ -369,6 +376,14 @@ func (rf *Raft) runElection(electionTerm int) bool {
 	mu_voted.Lock()
 	for voted < (length+1)/2 {
 		cond.Wait()
+		rf.mu.Lock()
+		if rf.currentTerm > electionTerm {
+			rf.mu.Unlock()
+			mu_voted.Unlock()
+			prettydebug.Debug(prettydebug.DVote, "S%d election failed, election term: %d", rf.me, electionTerm)
+			return false
+		}
+		rf.mu.Unlock()
 	}
 	mu_voted.Unlock()
 	// entering leader state
@@ -399,22 +414,23 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 						Term:      t,
 						LearderID: m,
 					}
+					prettydebug.Debug(prettydebug.DLeader, "S%d ping s%d, currurent term: %d", rf.me, i, t)
 					ok := rf.sendAppendEntries(i, &args, &replay)
 					if ok {
+						rf.mu.Lock()
 						if replay.Success {
-							rf.mu.Lock()
-							rf.heartbeat = true
 							rf.mu.Unlock()
 							time.Sleep(110 * time.Millisecond)
 						} else if replay.Term > rf.currentTerm {
 							// there exist server with higher term, change to follower
-							rf.mu.Lock()
 							rf.currentTerm = replay.Term
 							rf.votedFor = -1
 							rf.state = follower
+							prettydebug.Debug(prettydebug.DInfo, "S%d is follower, term: %d", rf.me, rf.currentTerm)
 							rf.mu.Unlock()
 						}
 					} else {
+						prettydebug.Debug(prettydebug.DInfo, "S%d send heartbeat failed, term: %d", rf.me, rf.currentTerm)
 						time.Sleep(110 * time.Millisecond)
 					}
 					rf.mu.Lock()
