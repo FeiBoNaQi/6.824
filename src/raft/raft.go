@@ -69,6 +69,7 @@ type Raft struct {
 	currentTerm int
 	votedFor    int
 	heartbeat   bool
+	state       string
 }
 
 // return currentTerm and whether this server
@@ -78,6 +79,14 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term = rf.currentTerm
+	if rf.state == leader {
+		isleader = true
+	} else {
+		isleader = false
+	}
 	return term, isleader
 }
 
@@ -145,6 +154,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term        int
+	CandidateID int
 }
 
 //
@@ -153,6 +164,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -160,6 +173,32 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		prettydebug.Debug(prettydebug.DVote, "S%d Vote, refuse %d, Vote for %d", rf.me, args.CandidateID, rf.votedFor)
+	} else if args.Term == rf.currentTerm {
+		if args.CandidateID == rf.votedFor {
+			reply.Term = rf.currentTerm
+			reply.VoteGranted = true
+			rf.heartbeat = true
+			prettydebug.Debug(prettydebug.DVote, "S%d Vote, Vote for %d", rf.me, rf.votedFor)
+		} else {
+			reply.Term = rf.currentTerm
+			reply.VoteGranted = false
+			prettydebug.Debug(prettydebug.DVote, "S%d Vote, refuse %d, Vote for %d", rf.me, args.CandidateID, rf.votedFor)
+		}
+	} else {
+		reply.Term = args.Term
+		reply.VoteGranted = true
+		rf.currentTerm = args.Term
+		rf.state = follower
+		rf.heartbeat = true
+		rf.votedFor = args.CandidateID
+		prettydebug.Debug(prettydebug.DVote, "S%d Vote, Vote for %d", rf.me, rf.votedFor)
+	}
 }
 
 //
@@ -241,21 +280,97 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) runElection(electionTerm int) bool {
+	rf.mu.Lock()
+	length := len(rf.peers)
+	voted := 1
+	var mu_voted sync.Mutex
+	cond := sync.NewCond(&mu_voted)
+	if rf.currentTerm == electionTerm {
+		// for every peer, start a seperate go routine to ask for votes
+		for index, _ := range rf.peers {
+			// do not send rpc to candidate server itself
+			if index == rf.me {
+				continue
+			}
+			go func(i int, t int, m int) bool {
+				var backoff time.Duration = 1
+				for {
+					replay := RequestVoteReply{}
+					args := RequestVoteArgs{
+						Term:        t,
+						CandidateID: m,
+					}
+					ok := rf.sendRequestVote(i, &args, &replay)
+					if ok {
+						if replay.VoteGranted {
+							mu_voted.Lock()
+							voted = voted + 1
+							mu_voted.Unlock()
+							cond.Signal()
+							return true
+						} else if replay.Term > t {
+							// entering follower state
+							rf.mu.Lock()
+							if replay.Term > rf.currentTerm {
+								rf.state = follower
+								rf.currentTerm = replay.Term
+								rf.votedFor = -1
+							}
+							rf.mu.Unlock()
+							return false
+						} else if replay.Term == t {
+							// peer's vote already gives to others
+							return false
+						}
+					} else {
+						time.Sleep(backoff * 10 * time.Millisecond)
+						backoff = backoff * 2
+						if backoff > 16 {
+							return false
+						}
+					}
+				}
+			}(index, electionTerm, rf.me)
+		}
+	}
+	rf.mu.Unlock()
+	mu_voted.Lock()
+	for voted < (length+1)/2 {
+		cond.Wait()
+	}
+	mu_voted.Unlock()
+	// entering leader state
+	rf.mu.Lock()
+	rf.state = leader
+	rf.currentTerm = electionTerm
+	rf.votedFor = -1
+	prettydebug.Debug(prettydebug.DLeader, "S%d becomes Leader, currurent term: %d", rf.me, electionTerm)
+	rf.mu.Unlock()
+	return true
+}
+
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
-	//protect rf.dead and rf.electionTimout
+	//protect rf.dead, rf.state and rf.heartbeat
 	rf.mu.Lock()
 	for rf.killed() == false {
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		if rf.heartbeat == false {
-			prettydebug.Debug(prettydebug.DTimer, "S%d Timer, election timeout", rf.me)
+		if !rf.heartbeat && rf.state != leader {
+			prettydebug.Debug(prettydebug.DTimer, "S%d Timer, election timeout, currurent term: %d", rf.me, rf.currentTerm)
+			// entering candidate state
+			rf.state = candidate
+			rf.currentTerm = rf.currentTerm + 1
+			rf.votedFor = rf.me
+			go rf.runElection(rf.currentTerm)
 		}
+		rf.heartbeat = false
 		rf.mu.Unlock()
-		time.Sleep(time.Duration(300*rand.Float32()) * time.Millisecond)
+		time.Sleep(time.Duration(150+300*rand.Float32()) * time.Millisecond)
 		rf.mu.Lock()
 	}
 	rf.mu.Unlock()
@@ -284,7 +399,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.mu.Lock()
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.heartbeat = false
+	rf.heartbeat = true
+	rf.state = follower
 	rf.mu.Unlock()
 
 	// initialize from state persisted before a crash
@@ -295,3 +411,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	return rf
 }
+
+const (
+	follower  string = "follower"
+	candidate string = "candidate"
+	leader    string = "leader"
+)
