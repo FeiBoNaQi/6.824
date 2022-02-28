@@ -31,7 +31,7 @@ import (
 )
 
 //
-// as each Raft peer becomes aware that successive log entries are
+// as each Raft peer becomes aware that Successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
 // CommandValid to true to indicate that the ApplyMsg contains a newly
@@ -68,7 +68,7 @@ type Raft struct {
 	// state a Raft server must maintain.
 	currentTerm int
 	votedFor    int
-	heartbeat   bool
+	heartbeat   bool // true means receive heart beat
 	state       string
 }
 
@@ -235,6 +235,37 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+type AppendEntriesArgs struct {
+	Term      int
+	LearderID int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	if rf.currentTerm <= args.Term {
+		rf.currentTerm = args.Term
+		rf.heartbeat = true
+		rf.votedFor = -1
+		rf.state = follower
+		reply.Success = true
+		reply.Term = args.Term
+	} else {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+	}
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -346,8 +377,54 @@ func (rf *Raft) runElection(electionTerm int) bool {
 	rf.currentTerm = electionTerm
 	rf.votedFor = -1
 	prettydebug.Debug(prettydebug.DLeader, "S%d becomes Leader, currurent term: %d", rf.me, electionTerm)
+	go rf.sendHeartBeat(electionTerm)
 	rf.mu.Unlock()
 	return true
+}
+
+func (rf *Raft) sendHeartBeat(electedTerm int) {
+	rf.mu.Lock()
+	if rf.currentTerm == electedTerm && rf.state == leader {
+		for index, _ := range rf.peers {
+			// do not send rpc to candidate server itself
+			if index == rf.me {
+				continue
+			}
+			go func(i int, t int, m int) {
+				rf.mu.Lock()
+				for rf.state == leader {
+					rf.mu.Unlock()
+					replay := AppendEntriesReply{}
+					args := AppendEntriesArgs{
+						Term:      t,
+						LearderID: m,
+					}
+					ok := rf.sendAppendEntries(i, &args, &replay)
+					if ok {
+						if replay.Success {
+							rf.mu.Lock()
+							rf.heartbeat = true
+							rf.mu.Unlock()
+							time.Sleep(110 * time.Millisecond)
+						} else if replay.Term > rf.currentTerm {
+							// there exist server with higher term, change to follower
+							rf.mu.Lock()
+							rf.currentTerm = replay.Term
+							rf.votedFor = -1
+							rf.state = follower
+							rf.mu.Unlock()
+						}
+					} else {
+						time.Sleep(110 * time.Millisecond)
+					}
+					rf.mu.Lock()
+				}
+				rf.mu.Unlock()
+			}(index, electedTerm, rf.me)
+		}
+
+	}
+	rf.mu.Unlock()
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
