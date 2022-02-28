@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -45,8 +46,11 @@ const (
 
 var debugStart time.Time
 var debugVerbosity int
+var mutex sync.Mutex
 
 func Init() {
+	mutex.Lock()
+	defer mutex.Unlock()
 	debugVerbosity = getVerbosity()
 	debugStart = time.Now()
 
@@ -54,6 +58,8 @@ func Init() {
 }
 
 func Debug(topic logTopic, format string, a ...interface{}) {
+	mutex.Lock()
+	defer mutex.Unlock()
 	if debugVerbosity >= 1 {
 		time := time.Since(debugStart).Microseconds()
 		time /= 1000

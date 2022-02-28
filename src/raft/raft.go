@@ -180,7 +180,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 		prettydebug.Debug(prettydebug.DVote, "S%d Vote, refuse %d, Vote for %d", rf.me, args.CandidateID, rf.votedFor)
 	} else if args.Term == rf.currentTerm {
-		if args.CandidateID == rf.votedFor {
+		if args.CandidateID == rf.votedFor || rf.votedFor == -1 {
 			reply.Term = rf.currentTerm
 			reply.VoteGranted = true
 			rf.heartbeat = true
@@ -258,6 +258,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		prettydebug.Debug(prettydebug.DInfo, "S%d is refuse ping from %d, term: %d", rf.me, args.LearderID, rf.currentTerm)
 	}
 	rf.mu.Unlock()
 }
@@ -399,7 +400,7 @@ func (rf *Raft) runElection(electionTerm int) bool {
 
 func (rf *Raft) sendHeartBeat(electedTerm int) {
 	rf.mu.Lock()
-	if rf.currentTerm == electedTerm && rf.state == leader {
+	for rf.currentTerm == electedTerm && rf.state == leader {
 		for index, _ := range rf.peers {
 			// do not send rpc to candidate server itself
 			if index == rf.me {
@@ -407,7 +408,7 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 			}
 			go func(i int, t int, m int) {
 				rf.mu.Lock()
-				for rf.state == leader {
+				if rf.state == leader {
 					rf.mu.Unlock()
 					replay := AppendEntriesReply{}
 					args := AppendEntriesArgs{
@@ -418,27 +419,25 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 					ok := rf.sendAppendEntries(i, &args, &replay)
 					if ok {
 						rf.mu.Lock()
-						if replay.Success {
-							rf.mu.Unlock()
-							time.Sleep(110 * time.Millisecond)
-						} else if replay.Term > rf.currentTerm {
+						if replay.Term > rf.currentTerm {
 							// there exist server with higher term, change to follower
 							rf.currentTerm = replay.Term
 							rf.votedFor = -1
 							rf.state = follower
 							prettydebug.Debug(prettydebug.DInfo, "S%d is follower, term: %d", rf.me, rf.currentTerm)
-							rf.mu.Unlock()
 						}
+						rf.mu.Unlock()
 					} else {
-						prettydebug.Debug(prettydebug.DInfo, "S%d send heartbeat failed, term: %d", rf.me, rf.currentTerm)
-						time.Sleep(110 * time.Millisecond)
+						prettydebug.Debug(prettydebug.DInfo, "S%d send heartbeat failed, term: %d", rf.me, electedTerm)
 					}
-					rf.mu.Lock()
+				} else {
+					rf.mu.Unlock()
 				}
-				rf.mu.Unlock()
 			}(index, electedTerm, rf.me)
 		}
-
+		rf.mu.Unlock()
+		time.Sleep(110 * time.Millisecond)
+		rf.mu.Lock()
 	}
 	rf.mu.Unlock()
 }
