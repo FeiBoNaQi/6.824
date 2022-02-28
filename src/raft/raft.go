@@ -426,6 +426,7 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 							rf.state = follower
 							prettydebug.Debug(prettydebug.DInfo, "S%d is follower, term: %d", rf.me, rf.currentTerm)
 						}
+						// if the reply is no higher, simply release the lock, those reply means noting to leader
 						rf.mu.Unlock()
 					} else {
 						prettydebug.Debug(prettydebug.DInfo, "S%d send heartbeat failed, term: %d", rf.me, electedTerm)
