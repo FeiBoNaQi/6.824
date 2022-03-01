@@ -250,15 +250,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.currentTerm <= args.Term {
 		rf.currentTerm = args.Term
 		rf.heartbeat = true
-		rf.votedFor = -1
+		rf.votedFor = args.LearderID // receive ping, only leader send ping message
 		rf.state = follower
 		reply.Success = true
 		reply.Term = args.Term
-		prettydebug.Debug(prettydebug.DInfo, "S%d is follower, leader: %d, term: %d", rf.me, args.LearderID, rf.currentTerm)
+		prettydebug.Debug(prettydebug.DClient, "S%d is follower, leader: %d, term: %d", rf.me, args.LearderID, rf.currentTerm)
 	} else {
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		prettydebug.Debug(prettydebug.DInfo, "S%d is refuse ping from %d, term: %d", rf.me, args.LearderID, rf.currentTerm)
+		prettydebug.Debug(prettydebug.DLog, "S%d is refusing ping from %d, term: %d", rf.me, args.LearderID, rf.currentTerm)
 	}
 	rf.mu.Unlock()
 }
@@ -343,6 +343,7 @@ func (rf *Raft) runElection(electionTerm int) bool {
 						if replay.VoteGranted {
 							mu_voted.Lock()
 							voted = voted + 1
+							prettydebug.Debug(prettydebug.DVote, "S%d receive votes from server%d, term: %d", m, i, t)
 							mu_voted.Unlock()
 							cond.Signal()
 							return true
@@ -352,7 +353,7 @@ func (rf *Raft) runElection(electionTerm int) bool {
 							if replay.Term > rf.currentTerm {
 								rf.state = follower
 								rf.currentTerm = replay.Term
-								rf.votedFor = -1
+								rf.votedFor = -1 // election was ended by a higher term, but we do not know who the leader is
 							}
 							rf.mu.Unlock()
 							cond.Signal()
@@ -391,7 +392,7 @@ func (rf *Raft) runElection(electionTerm int) bool {
 	rf.mu.Lock()
 	rf.state = leader
 	rf.currentTerm = electionTerm
-	rf.votedFor = -1
+	rf.votedFor = rf.me //leader vote for itself
 	prettydebug.Debug(prettydebug.DLeader, "S%d becomes Leader, currurent term: %d", rf.me, electionTerm)
 	go rf.sendHeartBeat(electionTerm)
 	rf.mu.Unlock()
@@ -415,7 +416,7 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 						Term:      t,
 						LearderID: m,
 					}
-					prettydebug.Debug(prettydebug.DLeader, "S%d ping s%d, currurent term: %d", rf.me, i, t)
+					prettydebug.Debug(prettydebug.DLog, "S%d ping s%d, currurent term: %d", rf.me, i, t)
 					ok := rf.sendAppendEntries(i, &args, &replay)
 					if ok {
 						rf.mu.Lock()
@@ -424,12 +425,12 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 							rf.currentTerm = replay.Term
 							rf.votedFor = -1
 							rf.state = follower
-							prettydebug.Debug(prettydebug.DInfo, "S%d is follower, term: %d", rf.me, rf.currentTerm)
+							prettydebug.Debug(prettydebug.DClient, "S%d is follower, term: %d", rf.me, rf.currentTerm)
 						}
 						// if the reply is no higher, simply release the lock, those reply means noting to leader
 						rf.mu.Unlock()
 					} else {
-						prettydebug.Debug(prettydebug.DInfo, "S%d send heartbeat failed, term: %d", rf.me, electedTerm)
+						prettydebug.Debug(prettydebug.DWarn, "S%d send heartbeat to S%d failed, term: %d", rf.me, i, electedTerm)
 					}
 				} else {
 					rf.mu.Unlock()
