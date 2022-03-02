@@ -425,6 +425,7 @@ func (rf *Raft) sendLogEntries(electedTerm int) {
 						if replay.Success { // append entry successful
 							rf.matchIndex[i] = rf.nextIndex[i]
 							rf.nextIndex[i] = rf.nextIndex[i] + 1
+							prettydebug.Debug(prettydebug.DClient, "S%d server%d,match index: %d, commit index: %d, term: %d", rf.me, i, rf.matchIndex[i], rf.commitIndex, rf.currentTerm)
 
 							// loop through peers to check if commitIndex need update
 							if rf.matchIndex[i] > rf.commitIndex {
@@ -434,7 +435,7 @@ func (rf *Raft) sendLogEntries(electedTerm int) {
 										count++
 									}
 								}
-								if count >= (len(rf.peers)+1)/2 {
+								if count >= (len(rf.peers)-1)/2 {
 									rf.commitIndex = rf.matchIndex[i]
 								}
 							}
