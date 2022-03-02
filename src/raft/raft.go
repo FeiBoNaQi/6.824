@@ -338,6 +338,15 @@ func (rf *Raft) runElection(electionTerm int) bool {
 						Term:        t,
 						CandidateID: m,
 					}
+
+					rf.mu.Lock() //check again that code is still electing
+					if rf.currentTerm != t || rf.state != candidate {
+						cond.Signal()
+						rf.mu.Unlock()
+						return false
+					}
+					rf.mu.Unlock()
+
 					ok := rf.sendRequestVote(i, &args, &replay)
 					if ok {
 						if replay.VoteGranted {
@@ -409,7 +418,7 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 			}
 			go func(i int, t int, m int) {
 				rf.mu.Lock()
-				if rf.state == leader {
+				if rf.state == leader && electedTerm == rf.currentTerm {
 					rf.mu.Unlock()
 					replay := AppendEntriesReply{}
 					args := AppendEntriesArgs{
