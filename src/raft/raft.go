@@ -302,7 +302,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// if raft server is not group leader, return immediately
+	if rf.state != leader {
+		isLeader = false
+		return index, term, isLeader
+	}
 	return index, term, isLeader
 }
 
