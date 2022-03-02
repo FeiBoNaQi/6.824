@@ -73,8 +73,12 @@ type Raft struct {
 	// 2B log repelication
 	commitIndex int
 	lastApplied int
-	nextIndex   []int
+	nextIndex   []int // index 1 point to first log, index 0 kept as a starting point for logic comparison, index 0 has term 0
 	matchIndex  []int
+	logTerm     []int // every server as a log term history
+	cond        sync.Cond
+	log         []interface{}
+	applyCh     chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -250,7 +254,7 @@ type AppendEntriesArgs struct {
 	// 2B log repelication
 	PrevLogIndex int
 	PrevLogTerm  int
-	Entries      interface{}
+	Entries      []interface{}
 	LeaderCommit int
 }
 
@@ -259,20 +263,58 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a < b {
+		return b
+	}
+	return a
+}
+
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	if rf.currentTerm <= args.Term {
-		rf.currentTerm = args.Term
-		rf.heartbeat = true
-		rf.votedFor = args.LearderID // receive ping, only leader send ping message
-		rf.state = follower
-		reply.Success = true
-		reply.Term = args.Term
-		prettydebug.Debug(prettydebug.DClient, "S%d is follower, leader: %d, term: %d", rf.me, args.LearderID, rf.currentTerm)
-	} else {
+		if len(args.Entries) == 0 { // handle ping
+			rf.currentTerm = args.Term
+			rf.heartbeat = true
+			rf.votedFor = args.LearderID // receive ping, only leader send ping message
+			rf.state = follower
+			reply.Term = args.Term
+			reply.Success = true
+			prettydebug.Debug(prettydebug.DClient, "S%d is follower, leader: %d, term: %d", rf.me, args.LearderID, rf.currentTerm)
+		} else { // handle log replication
+			rf.currentTerm = args.Term
+			rf.heartbeat = true
+			rf.votedFor = args.LearderID // receive ping, only leader send ping message
+			rf.state = follower
+			reply.Term = args.Term
+			// PrevLogIndex outbound existing log
+			if len(rf.logTerm) < args.PrevLogIndex+1 {
+				reply.Success = false
+				prettydebug.Debug(prettydebug.DClient, "S%d PrevLogIndex outbound existing log, log number: %d, rpc PrevLogIndex: %d, term: %d", rf.me, len(rf.logTerm), args.PrevLogIndex, rf.currentTerm)
+			} else if rf.logTerm[args.PrevLogIndex] != args.PrevLogTerm { // PrevLogTerm don't match
+				reply.Success = false
+				rf.log = rf.log[:args.PrevLogIndex-1]
+				prettydebug.Debug(prettydebug.DClient, "S%d PrevLogIndex PrevLogTerm don't match, log term: %d, rpc PrevLogTerm: %d, current term: %d", rf.me, rf.logTerm[args.PrevLogIndex], args.PrevLogTerm, rf.currentTerm)
+			} else { // every thing before match, append the new entries
+				reply.Success = true
+				rf.log = append(rf.log, args.Entries...)
+				prettydebug.Debug(prettydebug.DClient, "S%d appending log entries: %d", rf.me, args.PrevLogIndex+1)
+				if args.LeaderCommit > rf.commitIndex {
+					rf.commitIndex = min(args.LearderID, args.PrevLogIndex+1)
+				}
+			}
+		}
+	} else { // outdated message
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		prettydebug.Debug(prettydebug.DLog, "S%d is refusing ping from %d, term: %d", rf.me, args.LearderID, rf.currentTerm)
+		prettydebug.Debug(prettydebug.DLog, "S%d is refusing outdated appendEntries rpc from %d, term: %d", rf.me, args.LearderID, rf.currentTerm)
 	}
 	rf.mu.Unlock()
 }
@@ -309,7 +351,100 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		isLeader = false
 		return index, term, isLeader
 	}
+	// append the arrival command into leader's log entry and return immediately, signal the cond variable
+	rf.log = append(rf.log, command)
+	index = len(rf.log) - 1
+	term = rf.currentTerm
+	isLeader = true
+	rf.cond.Broadcast()
 	return index, term, isLeader
+}
+
+// must run with rf.mu mutex held
+func (rf *Raft) checkLeadTerm(electedTerm int) {
+	// no longer being the leader, return
+	if rf.state != leader {
+		prettydebug.Debug(prettydebug.DLog2, "S%d only leader can send log entries", rf.me)
+		return
+	}
+	// if current term change from elected term, quit sending logs
+	if rf.currentTerm != electedTerm {
+		prettydebug.Debug(prettydebug.DLog2, "S%d current term: %d, elected term: %d, stop sending log entries", rf.me, rf.currentTerm, electedTerm)
+		rf.mu.Unlock()
+		return
+	}
+}
+
+func (rf *Raft) sendLogEntries(electedTerm int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.checkLeadTerm(electedTerm)
+	// for every peer, start a go routine to send the new log
+	for index := range rf.peers {
+		if index == rf.me {
+			continue
+		}
+		go func(i int, t int) {
+			for {
+				rf.mu.Lock()
+				rf.checkLeadTerm(electedTerm)
+				// every thing commited, sleep in cond variable
+				for rf.nextIndex[i] == len(rf.log) {
+					rf.cond.Wait()
+				}
+				replay := AppendEntriesReply{}
+				args := AppendEntriesArgs{
+					Term:         t,
+					LearderID:    rf.me,
+					PrevLogIndex: rf.nextIndex[i] - 1,
+					PrevLogTerm:  rf.logTerm[rf.nextIndex[i]-1],
+					Entries:      rf.log[rf.nextIndex[i]:],
+					LeaderCommit: rf.commitIndex,
+				}
+				prettydebug.Debug(prettydebug.DLog, "S%d sends log%d to s%d, currurent term: %d", rf.me, rf.nextIndex[i], i, t)
+				rf.mu.Unlock() // sendAppendEntries is blocking rpc, release the lock
+				ok := rf.sendAppendEntries(i, &args, &replay)
+				// to do
+				// use heart beat to decide if we should send next ping message
+				if ok {
+					rf.mu.Lock()
+					if replay.Term > rf.currentTerm { // there exist server with higher term, change to follower
+						rf.currentTerm = replay.Term
+						rf.votedFor = -1
+						rf.state = follower
+						prettydebug.Debug(prettydebug.DClient, "S%d is follower, term: %d", rf.me, rf.currentTerm)
+					} else if replay.Term == rf.currentTerm { //handle rpc reply
+						if replay.Success { // append entry successful
+							rf.matchIndex[i] = rf.nextIndex[i]
+							rf.nextIndex[i] = rf.nextIndex[i] + 1
+
+							// loop through peers to check if commitIndex need update
+							if rf.matchIndex[i] > rf.commitIndex {
+								count := 0
+								for peerIndex := range rf.peers {
+									if rf.matchIndex[peerIndex] >= rf.matchIndex[i] {
+										count++
+									}
+								}
+								if count >= (len(rf.peers)+1)/2 {
+									rf.commitIndex = rf.matchIndex[i]
+								}
+							}
+						} else { // append entry failed
+							rf.nextIndex[i] = rf.nextIndex[i] - 1
+						}
+					} else if replay.Term < electedTerm {
+						panic("reply term can not be smaller than current term")
+					}
+					// if the reply is no higher, simply release the lock, those reply means noting to leader
+					rf.mu.Unlock()
+				} else {
+					prettydebug.Debug(prettydebug.DWarn, "S%d send sendLogEntries to S%d failed, term: %d", rf.me, i, electedTerm)
+					time.Sleep(110 * time.Millisecond)
+				}
+			}
+		}(index, electedTerm)
+	}
 }
 
 //
@@ -421,9 +556,15 @@ func (rf *Raft) runElection(electionTerm int) bool {
 	rf.mu.Lock()
 	rf.state = leader
 	rf.currentTerm = electionTerm
-	rf.votedFor = rf.me //leader vote for itself
+	rf.votedFor = rf.me                       //leader vote for itself
+	rf.nextIndex = make([]int, len(rf.peers)) //initialize nextindex and matchIndex
+	rf.matchIndex = make([]int, len(rf.peers))
+	for index := range rf.nextIndex {
+		rf.nextIndex[index] = len(rf.log)
+	}
 	prettydebug.Debug(prettydebug.DLeader, "S%d becomes Leader, currurent term: %d", rf.me, electionTerm)
 	go rf.sendHeartBeat(electionTerm)
+	go rf.sendLogEntries(electionTerm)
 	rf.mu.Unlock()
 	return true
 }
@@ -445,7 +586,7 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 						Term:      t,
 						LearderID: m,
 					}
-					prettydebug.Debug(prettydebug.DLog, "S%d ping s%d, currurent term: %d", rf.me, i, t)
+					prettydebug.Debug(prettydebug.DLeader, "S%d ping s%d, currurent term: %d", rf.me, i, t)
 					ok := rf.sendAppendEntries(i, &args, &replay)
 					if ok {
 						rf.mu.Lock()
@@ -491,6 +632,15 @@ func (rf *Raft) ticker() {
 			rf.votedFor = rf.me
 			go rf.runElection(rf.currentTerm)
 		}
+		for rf.commitIndex > rf.lastApplied {
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[rf.lastApplied+1],
+				CommandIndex: rf.lastApplied, // command index start from 0, but actual log start from 1
+			}
+			prettydebug.Debug(prettydebug.DLog, "S%d send log: %d to applyCh", rf.me, rf.log[rf.lastApplied+1])
+			rf.lastApplied = rf.lastApplied + 1
+		}
 		rf.heartbeat = false
 		rf.mu.Unlock()
 		time.Sleep(time.Duration(150+300*rand.Float32()) * time.Millisecond)
@@ -524,6 +674,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.heartbeat = true
 	rf.state = follower
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.cond = *sync.NewCond(&rf.mu)
+	rf.logTerm = make([]int, 0, 100)
+	rf.log = make([]interface{}, 0, 100)
+	rf.logTerm = append(rf.logTerm, 0) // logTerm[0] default to 0
+	rf.log = append(rf.log, 0)         // log[0] default to 0
+	rf.applyCh = applyCh
 	rf.mu.Unlock()
 
 	// initialize from state persisted before a crash
