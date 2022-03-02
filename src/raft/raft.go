@@ -296,7 +296,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Term = args.Term
 			reply.Success = true
 			if args.LeaderCommit > rf.commitIndex {
-				rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+				if (len(rf.logTerm) >= args.PrevLogIndex+1) && (rf.logTerm[args.PrevLogIndex] == args.PrevLogTerm) {
+					rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex)
+				}
 			}
 			prettydebug.Debug(prettydebug.DClient, "S%d is follower, leader: %d, term: %d", rf.me, args.LearderID, rf.currentTerm)
 		} else { // handle log replication
@@ -311,16 +313,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				prettydebug.Debug(prettydebug.DClient, "S%d PrevLogIndex outbound existing log, log number: %d, rpc PrevLogIndex: %d, term: %d", rf.me, len(rf.logTerm), args.PrevLogIndex, rf.currentTerm)
 			} else if rf.logTerm[args.PrevLogIndex] != args.PrevLogTerm { // PrevLogTerm don't match
 				reply.Success = false
+				prettydebug.Debug(prettydebug.DClient, "S%d PrevLogIndex PrevLogTerm don't match, log term: %d, rpc PrevLogTerm: %d, current term: %d", rf.me, rf.logTerm[args.PrevLogIndex], args.PrevLogTerm, rf.currentTerm)
 				rf.log = rf.log[:args.PrevLogIndex-1]
 				rf.logTerm = rf.logTerm[:args.PrevLogIndex-1]
-				prettydebug.Debug(prettydebug.DClient, "S%d PrevLogIndex PrevLogTerm don't match, log term: %d, rpc PrevLogTerm: %d, current term: %d", rf.me, rf.logTerm[args.PrevLogIndex], args.PrevLogTerm, rf.currentTerm)
 			} else { // every thing before match, append the new entries
 				reply.Success = true
 				rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
 				rf.logTerm = append(rf.logTerm[:args.PrevLogIndex+1], args.Terms...)
 				prettydebug.Debug(prettydebug.DClient, "S%d appending log entries: %d", rf.me, args.PrevLogIndex+1)
 				if args.LeaderCommit > rf.commitIndex {
-					rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+1)
+					rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+1+len(args.Entries))
 				}
 			}
 		}
@@ -603,7 +605,6 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 			go func(i int, t int, m int) {
 				rf.mu.Lock()
 				if rf.state == leader && electedTerm == rf.currentTerm {
-					rf.mu.Unlock()
 					replay := AppendEntriesReply{}
 					args := AppendEntriesArgs{
 						Term:         t,
@@ -612,6 +613,7 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 						PrevLogTerm:  rf.logTerm[rf.nextIndex[i]-1],
 						LeaderCommit: rf.commitIndex,
 					}
+					rf.mu.Unlock()
 					prettydebug.Debug(prettydebug.DLeader, "S%d ping s%d, currurent term: %d", rf.me, i, t)
 					ok := rf.sendAppendEntries(i, &args, &replay)
 					if ok {
