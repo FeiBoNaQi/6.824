@@ -70,6 +70,11 @@ type Raft struct {
 	votedFor    int
 	heartbeat   bool // true means receive heart beat
 	state       string
+	// 2B log repelication
+	commitIndex int
+	lastApplied int
+	nextIndex   []int
+	matchIndex  []int
 }
 
 // return currentTerm and whether this server
@@ -156,6 +161,9 @@ type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term        int
 	CandidateID int
+	// 2B log repelication, leader election must examine log
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -236,8 +244,14 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 type AppendEntriesArgs struct {
+	// 2A heart beat implementation
 	Term      int
 	LearderID int
+	// 2B log repelication
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      interface{}
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
