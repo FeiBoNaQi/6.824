@@ -255,6 +255,7 @@ type AppendEntriesArgs struct {
 	PrevLogIndex int
 	PrevLogTerm  int
 	Entries      []interface{}
+	Terms        []int
 	LeaderCommit int
 }
 
@@ -287,6 +288,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.state = follower
 			reply.Term = args.Term
 			reply.Success = true
+			if args.LeaderCommit > rf.commitIndex {
+				rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+1)
+			}
 			prettydebug.Debug(prettydebug.DClient, "S%d is follower, leader: %d, term: %d", rf.me, args.LearderID, rf.currentTerm)
 		} else { // handle log replication
 			rf.currentTerm = args.Term
@@ -301,13 +305,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			} else if rf.logTerm[args.PrevLogIndex] != args.PrevLogTerm { // PrevLogTerm don't match
 				reply.Success = false
 				rf.log = rf.log[:args.PrevLogIndex-1]
+				rf.logTerm = rf.logTerm[:args.PrevLogIndex-1]
 				prettydebug.Debug(prettydebug.DClient, "S%d PrevLogIndex PrevLogTerm don't match, log term: %d, rpc PrevLogTerm: %d, current term: %d", rf.me, rf.logTerm[args.PrevLogIndex], args.PrevLogTerm, rf.currentTerm)
 			} else { // every thing before match, append the new entries
 				reply.Success = true
 				rf.log = append(rf.log, args.Entries...)
+				rf.logTerm = append(rf.logTerm, args.Terms...)
 				prettydebug.Debug(prettydebug.DClient, "S%d appending log entries: %d", rf.me, args.PrevLogIndex+1)
 				if args.LeaderCommit > rf.commitIndex {
-					rf.commitIndex = min(args.LearderID, args.PrevLogIndex+1)
+					rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+1)
 				}
 			}
 		}
@@ -353,6 +359,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	// append the arrival command into leader's log entry and return immediately, signal the cond variable
 	rf.log = append(rf.log, command)
+	rf.logTerm = append(rf.logTerm, rf.currentTerm)
 	index = len(rf.log) - 1
 	term = rf.currentTerm
 	isLeader = true
@@ -399,6 +406,7 @@ func (rf *Raft) sendLogEntries(electedTerm int) {
 					PrevLogIndex: rf.nextIndex[i] - 1,
 					PrevLogTerm:  rf.logTerm[rf.nextIndex[i]-1],
 					Entries:      rf.log[rf.nextIndex[i]:],
+					Terms:        rf.logTerm[rf.nextIndex[i]:],
 					LeaderCommit: rf.commitIndex,
 				}
 				prettydebug.Debug(prettydebug.DLog, "S%d sends log%d to s%d, currurent term: %d", rf.me, rf.nextIndex[i], i, t)
@@ -583,8 +591,11 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 					rf.mu.Unlock()
 					replay := AppendEntriesReply{}
 					args := AppendEntriesArgs{
-						Term:      t,
-						LearderID: m,
+						Term:         t,
+						LearderID:    rf.me,
+						PrevLogIndex: rf.nextIndex[i] - 1,
+						PrevLogTerm:  rf.logTerm[rf.nextIndex[i]-1],
+						LeaderCommit: rf.commitIndex,
 					}
 					prettydebug.Debug(prettydebug.DLeader, "S%d ping s%d, currurent term: %d", rf.me, i, t)
 					ok := rf.sendAppendEntries(i, &args, &replay)
@@ -636,7 +647,7 @@ func (rf *Raft) ticker() {
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
 				Command:      rf.log[rf.lastApplied+1],
-				CommandIndex: rf.lastApplied, // command index start from 0, but actual log start from 1
+				CommandIndex: rf.lastApplied + 1, // command index start from 1 same as actual log start from 1
 			}
 			prettydebug.Debug(prettydebug.DLog, "S%d send log: %d to applyCh", rf.me, rf.log[rf.lastApplied+1])
 			rf.lastApplied = rf.lastApplied + 1
