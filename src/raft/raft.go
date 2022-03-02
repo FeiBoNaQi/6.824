@@ -339,7 +339,7 @@ func (rf *Raft) runElection(electionTerm int) bool {
 	cond := sync.NewCond(&mu_voted)
 	if rf.currentTerm == electionTerm {
 		// for every peer, start a seperate go routine to ask for votes
-		for index, _ := range rf.peers {
+		for index := range rf.peers {
 			// do not send rpc to candidate server itself
 			if index == rf.me {
 				continue
@@ -425,7 +425,7 @@ func (rf *Raft) runElection(electionTerm int) bool {
 func (rf *Raft) sendHeartBeat(electedTerm int) {
 	rf.mu.Lock()
 	for rf.currentTerm == electedTerm && rf.state == leader {
-		for index, _ := range rf.peers {
+		for index := range rf.peers {
 			// do not send rpc to candidate server itself
 			if index == rf.me {
 				continue
@@ -472,7 +472,7 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 func (rf *Raft) ticker() {
 	//protect rf.dead, rf.state and rf.heartbeat
 	rf.mu.Lock()
-	for rf.killed() == false {
+	for !rf.killed() {
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
