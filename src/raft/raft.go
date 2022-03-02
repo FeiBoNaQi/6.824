@@ -191,25 +191,32 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		prettydebug.Debug(prettydebug.DVote, "S%d Vote, refuse %d, Vote for %d", rf.me, args.CandidateID, rf.votedFor)
-	} else if args.Term == rf.currentTerm {
-		if args.CandidateID == rf.votedFor || rf.votedFor == -1 {
-			reply.Term = rf.currentTerm
-			reply.VoteGranted = true
-			rf.heartbeat = true
-			prettydebug.Debug(prettydebug.DVote, "S%d Vote, Vote for %d", rf.me, rf.votedFor)
+	} else { //args.Term >= rf.currentTerm
+		if args.CandidateID == rf.votedFor || rf.votedFor == -1 || args.Term > rf.currentTerm {
+			if args.LastLogTerm > rf.logTerm[len(rf.logTerm)-1] { // request more up to date
+				reply.VoteGranted = true
+				rf.state = follower
+				rf.heartbeat = true
+				rf.votedFor = args.CandidateID
+				prettydebug.Debug(prettydebug.DVote, "S%d Vote, Vote for %d", rf.me, rf.votedFor)
+			} else if args.LastLogTerm == rf.logTerm[len(rf.logTerm)-1] {
+				if args.LastLogIndex >= len(rf.log)-1 { // request more up to date
+					reply.VoteGranted = true
+					rf.state = follower
+					rf.heartbeat = true
+					rf.votedFor = args.CandidateID
+					prettydebug.Debug(prettydebug.DVote, "S%d Vote, Vote for %d", rf.me, rf.votedFor)
+				} else { // request outdated
+					reply.VoteGranted = false
+				}
+			} else { // request outdated
+				reply.VoteGranted = false
+			}
 		} else {
-			reply.Term = rf.currentTerm
 			reply.VoteGranted = false
-			prettydebug.Debug(prettydebug.DVote, "S%d Vote, refuse %d, Vote for %d", rf.me, args.CandidateID, rf.votedFor)
 		}
-	} else {
 		reply.Term = args.Term
-		reply.VoteGranted = true
 		rf.currentTerm = args.Term
-		rf.state = follower
-		rf.heartbeat = true
-		rf.votedFor = args.CandidateID
-		prettydebug.Debug(prettydebug.DVote, "S%d Vote, Vote for %d", rf.me, rf.votedFor)
 	}
 }
 
@@ -289,7 +296,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Term = args.Term
 			reply.Success = true
 			if args.LeaderCommit > rf.commitIndex {
-				rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+1)
+				rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 			}
 			prettydebug.Debug(prettydebug.DClient, "S%d is follower, leader: %d, term: %d", rf.me, args.LearderID, rf.currentTerm)
 		} else { // handle log replication
@@ -309,8 +316,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				prettydebug.Debug(prettydebug.DClient, "S%d PrevLogIndex PrevLogTerm don't match, log term: %d, rpc PrevLogTerm: %d, current term: %d", rf.me, rf.logTerm[args.PrevLogIndex], args.PrevLogTerm, rf.currentTerm)
 			} else { // every thing before match, append the new entries
 				reply.Success = true
-				rf.log = append(rf.log, args.Entries...)
-				rf.logTerm = append(rf.logTerm, args.Terms...)
+				rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+				rf.logTerm = append(rf.logTerm[:args.PrevLogIndex+1], args.Terms...)
 				prettydebug.Debug(prettydebug.DClient, "S%d appending log entries: %d", rf.me, args.PrevLogIndex+1)
 				if args.LeaderCommit > rf.commitIndex {
 					rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+1)
@@ -368,24 +375,26 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 }
 
 // must run with rf.mu mutex held
-func (rf *Raft) checkLeadTerm(electedTerm int) {
+func (rf *Raft) checkLeadTerm(electedTerm int) bool {
 	// no longer being the leader, return
 	if rf.state != leader {
 		prettydebug.Debug(prettydebug.DLog2, "S%d only leader can send log entries", rf.me)
-		return
+		return false
 	}
 	// if current term change from elected term, quit sending logs
 	if rf.currentTerm != electedTerm {
 		prettydebug.Debug(prettydebug.DLog2, "S%d current term: %d, elected term: %d, stop sending log entries", rf.me, rf.currentTerm, electedTerm)
-		rf.mu.Unlock()
-		return
+		return false
 	}
+	return true
 }
 
 func (rf *Raft) sendLogEntries(electedTerm int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.checkLeadTerm(electedTerm)
+	if !rf.checkLeadTerm(electedTerm) {
+		return
+	}
 	// for every peer, start a go routine to send the new log
 	for index := range rf.peers {
 		if index == rf.me {
@@ -394,10 +403,13 @@ func (rf *Raft) sendLogEntries(electedTerm int) {
 		go func(i int, t int) {
 			for {
 				rf.mu.Lock()
-				rf.checkLeadTerm(electedTerm)
 				// every thing commited, sleep in cond variable
 				for rf.nextIndex[i] == len(rf.log) {
 					rf.cond.Wait()
+				}
+				if !rf.checkLeadTerm(electedTerm) {
+					rf.mu.Unlock()
+					return
 				}
 				replay := AppendEntriesReply{}
 				args := AppendEntriesArgs{
@@ -494,13 +506,15 @@ func (rf *Raft) runElection(electionTerm int) bool {
 			if index == rf.me {
 				continue
 			}
-			go func(i int, t int, m int) bool {
+			go func(i int, t int, m int, lli int, llt int) bool {
 				var backoff time.Duration = 1
 				for {
 					replay := RequestVoteReply{}
 					args := RequestVoteArgs{
-						Term:        t,
-						CandidateID: m,
+						Term:         t,
+						CandidateID:  m,
+						LastLogIndex: lli,
+						LastLogTerm:  llt,
 					}
 
 					rf.mu.Lock() //check again that code is still electing
@@ -544,7 +558,7 @@ func (rf *Raft) runElection(electionTerm int) bool {
 						}
 					}
 				}
-			}(index, electionTerm, rf.me)
+			}(index, electionTerm, rf.me, len(rf.log)-1, rf.logTerm[len(rf.log)-1])
 		}
 	}
 	rf.mu.Unlock()
