@@ -269,6 +269,8 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	// MisMatchTerm           int //if log replication failed, return the term of the failed entry, if entry don't exist, return last term
+	MisMatchTermStartIndex int //if log replication failed, return first index whose term failed the rpc, if entry don't exit, return first entry of the last term
 }
 
 func min(a, b int) int {
@@ -304,15 +306,30 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		} else { // handle log replication
 			rf.currentTerm = args.Term
 			rf.heartbeat = true
-			rf.votedFor = args.LearderID // receive ping, only leader send ping message
+			rf.votedFor = args.LearderID // receive log replication, only leader send log replication message
 			rf.state = follower
 			reply.Term = args.Term
 			// PrevLogIndex outbound existing log
 			if len(rf.logTerm) < args.PrevLogIndex+1 {
 				reply.Success = false
+				// reply.MisMatchTerm = rf.logTerm[len(rf.logTerm)-1]
+				// for i := len(rf.logTerm) - 1; i > 0; i-- {
+				// 	if rf.logTerm[i] != reply.MisMatchTerm {
+				// 		reply.MisMatchTermStartIndex = i + 1
+				// 		break
+				// 	}
+				// }
+				reply.MisMatchTermStartIndex = len(rf.logTerm)
 				prettydebug.Debug(prettydebug.DClient, "S%d PrevLogIndex outbound existing log, log number: %d, rpc PrevLogIndex: %d, term: %d", rf.me, len(rf.logTerm), args.PrevLogIndex, rf.currentTerm)
 			} else if rf.logTerm[args.PrevLogIndex] != args.PrevLogTerm { // PrevLogTerm don't match
 				reply.Success = false
+				MisMatchTerm := rf.logTerm[args.PrevLogIndex]
+				for i := args.PrevLogIndex - 1; i >= 0; i-- {
+					if rf.logTerm[i] != MisMatchTerm {
+						reply.MisMatchTermStartIndex = i + 1
+						break
+					}
+				}
 				prettydebug.Debug(prettydebug.DClient, "S%d PrevLogIndex PrevLogTerm don't match, log term: %d, rpc PrevLogTerm: %d, current term: %d", rf.me, rf.logTerm[args.PrevLogIndex], args.PrevLogTerm, rf.currentTerm)
 				rf.log = rf.log[:args.PrevLogIndex-1]
 				rf.logTerm = rf.logTerm[:args.PrevLogIndex-1]
@@ -437,8 +454,8 @@ func (rf *Raft) sendLogEntries(electedTerm int) {
 						prettydebug.Debug(prettydebug.DClient, "S%d is follower, term: %d", rf.me, rf.currentTerm)
 					} else if replay.Term == rf.currentTerm { //handle rpc reply
 						if replay.Success { // append entry successful
-							rf.matchIndex[i] = rf.nextIndex[i]
-							rf.nextIndex[i] = rf.nextIndex[i] + 1
+							rf.matchIndex[i] = rf.nextIndex[i] + len(args.Entries) - 1
+							rf.nextIndex[i] = rf.matchIndex[i] + 1
 							prettydebug.Debug(prettydebug.DClient, "S%d server%d,match index: %d, commit index: %d, term: %d", rf.me, i, rf.matchIndex[i], rf.commitIndex, rf.currentTerm)
 
 							// loop through peers to check if commitIndex need update
@@ -454,7 +471,7 @@ func (rf *Raft) sendLogEntries(electedTerm int) {
 								}
 							}
 						} else { // append entry failed
-							rf.nextIndex[i] = rf.nextIndex[i] - 1
+							rf.nextIndex[i] = replay.MisMatchTermStartIndex
 						}
 					} else if replay.Term < electedTerm {
 						panic("reply term can not be smaller than current term")
@@ -698,7 +715,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rand.Seed(time.Now().Unix())
 	rf.mu.Lock()
-	rf.currentTerm = 0
+	rf.currentTerm = 0 // start from term 0, after election it will be term 1, term 0 is reserved for the first default committed log
 	rf.votedFor = -1
 	rf.heartbeat = true
 	rf.state = follower
