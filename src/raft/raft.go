@@ -327,6 +327,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if args.LeaderCommit > rf.commitIndex {
 				if (len(rf.logTerm) >= args.PrevLogIndex+1) && (rf.logTerm[args.PrevLogIndex] == args.PrevLogTerm) {
 					rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex)
+					rf.applyLog()
 				}
 			}
 			prettydebug.Debug(prettydebug.DClient, "S%d is follower, leader: %d, term: %d", rf.me, args.LearderID, rf.currentTerm)
@@ -371,6 +372,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				prettydebug.Debug(prettydebug.DClient, "S%d appending log entries: %d", rf.me, args.PrevLogIndex+1)
 				if args.LeaderCommit > rf.commitIndex {
 					rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
+					rf.applyLog()
 				}
 			}
 		}
@@ -502,6 +504,7 @@ func (rf *Raft) sendLogEntries(electedTerm int) {
 								}
 								if count >= (len(rf.peers)-1)/2 {
 									rf.commitIndex = rf.matchIndex[i]
+									rf.applyLog()
 								}
 							}
 						} else { // append entry failed
@@ -706,6 +709,19 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 	rf.mu.Unlock()
 }
 
+// must run with mutex held
+func (rf *Raft) applyLog() {
+	for rf.commitIndex > rf.lastApplied {
+		rf.applyCh <- ApplyMsg{
+			CommandValid: true,
+			Command:      rf.log[rf.lastApplied+1],
+			CommandIndex: rf.lastApplied + 1, // command index start from 1 same as actual log start from 1
+		}
+		prettydebug.Debug(prettydebug.DLog, "S%d send log: %d to applyCh", rf.me, rf.log[rf.lastApplied+1])
+		rf.lastApplied = rf.lastApplied + 1
+	}
+}
+
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
@@ -725,15 +741,7 @@ func (rf *Raft) ticker() {
 			rf.persist()
 			go rf.runElection(rf.currentTerm)
 		}
-		for rf.commitIndex > rf.lastApplied {
-			rf.applyCh <- ApplyMsg{
-				CommandValid: true,
-				Command:      rf.log[rf.lastApplied+1],
-				CommandIndex: rf.lastApplied + 1, // command index start from 1 same as actual log start from 1
-			}
-			prettydebug.Debug(prettydebug.DLog, "S%d send log: %d to applyCh", rf.me, rf.log[rf.lastApplied+1])
-			rf.lastApplied = rf.lastApplied + 1
-		}
+		rf.applyLog()
 		rf.heartbeat = false
 		rf.mu.Unlock()
 		time.Sleep(time.Duration(150+300*rand.Float32()) * time.Millisecond)
