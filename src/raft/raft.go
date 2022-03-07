@@ -20,12 +20,14 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/prettydebug"
 )
@@ -66,8 +68,8 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	currentTerm int
-	votedFor    int
+	currentTerm int  //persist state
+	votedFor    int  //persist state
 	heartbeat   bool // true means receive heart beat
 	state       string
 	// 2B log repelication
@@ -75,9 +77,9 @@ type Raft struct {
 	lastApplied int
 	nextIndex   []int // index 1 point to first log, index 0 kept as a starting point for logic comparison, index 0 has term 0
 	matchIndex  []int
-	logTerm     []int // every server as a log term history
+	logTerm     []int // every server as a log term history //persist state
 	cond        sync.Cond
-	log         []interface{}
+	log         []interface{} //persist state
 	applyCh     chan ApplyMsg
 }
 
@@ -107,12 +109,14 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logTerm)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -124,17 +128,25 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var logTerm []int
+	var log []interface{}
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logTerm) != nil ||
+		d.Decode(&log) != nil {
+		prettydebug.Debug(prettydebug.DError, "S%d failed reload persistent state", rf.me)
+	} else {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.logTerm = logTerm
+		rf.log = log
+	}
 }
 
 //
@@ -198,6 +210,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				rf.state = follower
 				rf.heartbeat = true
 				rf.votedFor = args.CandidateID
+				rf.persist()
 				prettydebug.Debug(prettydebug.DVote, "S%d Vote, Vote for %d", rf.me, rf.votedFor)
 			} else if args.LastLogTerm == rf.logTerm[len(rf.logTerm)-1] {
 				if args.LastLogIndex >= len(rf.log)-1 { // request more up to date
@@ -205,6 +218,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 					rf.state = follower
 					rf.heartbeat = true
 					rf.votedFor = args.CandidateID
+					rf.persist()
 					prettydebug.Debug(prettydebug.DVote, "S%d Vote, Vote for %d", rf.me, rf.votedFor)
 				} else { // request outdated
 					reply.VoteGranted = false
@@ -217,6 +231,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 		reply.Term = args.Term
 		rf.currentTerm = args.Term
+		rf.persist()
 	}
 }
 
@@ -294,6 +309,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.currentTerm = args.Term
 			rf.heartbeat = true
 			rf.votedFor = args.LearderID // receive ping, only leader send ping message
+			rf.persist()
 			rf.state = follower
 			reply.Term = args.Term
 			reply.Success = true
@@ -307,6 +323,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.currentTerm = args.Term
 			rf.heartbeat = true
 			rf.votedFor = args.LearderID // receive log replication, only leader send log replication message
+			rf.persist()
 			rf.state = follower
 			reply.Term = args.Term
 			// PrevLogIndex outbound existing log
@@ -333,10 +350,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				prettydebug.Debug(prettydebug.DClient, "S%d PrevLogIndex PrevLogTerm don't match, log term: %d, rpc PrevLogTerm: %d, current term: %d", rf.me, rf.logTerm[args.PrevLogIndex], args.PrevLogTerm, rf.currentTerm)
 				rf.log = rf.log[:args.PrevLogIndex-1]
 				rf.logTerm = rf.logTerm[:args.PrevLogIndex-1]
+				rf.persist()
 			} else { // every thing before match, append the new entries
 				reply.Success = true
 				rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
 				rf.logTerm = append(rf.logTerm[:args.PrevLogIndex+1], args.Terms...)
+				rf.persist()
 				prettydebug.Debug(prettydebug.DClient, "S%d appending log entries: %d", rf.me, args.PrevLogIndex+1)
 				if args.LeaderCommit > rf.commitIndex {
 					rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+1+len(args.Entries))
@@ -386,6 +405,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// append the arrival command into leader's log entry and return immediately, signal the cond variable
 	rf.log = append(rf.log, command)
 	rf.logTerm = append(rf.logTerm, rf.currentTerm)
+	rf.persist()
 	index = len(rf.log) - 1
 	term = rf.currentTerm
 	isLeader = true
@@ -450,6 +470,7 @@ func (rf *Raft) sendLogEntries(electedTerm int) {
 					if replay.Term > rf.currentTerm { // there exist server with higher term, change to follower
 						rf.currentTerm = replay.Term
 						rf.votedFor = -1
+						rf.persist()
 						rf.state = follower
 						prettydebug.Debug(prettydebug.DClient, "S%d is follower, term: %d", rf.me, rf.currentTerm)
 					} else if replay.Term == rf.currentTerm { //handle rpc reply
@@ -459,7 +480,7 @@ func (rf *Raft) sendLogEntries(electedTerm int) {
 							prettydebug.Debug(prettydebug.DClient, "S%d server%d,match index: %d, commit index: %d, term: %d", rf.me, i, rf.matchIndex[i], rf.commitIndex, rf.currentTerm)
 
 							// loop through peers to check if commitIndex need update
-							if rf.matchIndex[i] > rf.commitIndex {
+							if rf.matchIndex[i] > rf.commitIndex && rf.logTerm[rf.matchIndex[i]] == rf.currentTerm {
 								count := 0
 								for peerIndex := range rf.peers {
 									if rf.matchIndex[peerIndex] >= rf.matchIndex[i] {
@@ -560,12 +581,14 @@ func (rf *Raft) runElection(electionTerm int) bool {
 								rf.state = follower
 								rf.currentTerm = replay.Term
 								rf.votedFor = -1 // election was ended by a higher term, but we do not know who the leader is
+								rf.persist()
 							}
 							rf.mu.Unlock()
 							cond.Signal()
 							return false
 						} else if replay.Term == t {
 							// peer's vote already gives to others
+							cond.Signal()
 							return false
 						}
 					} else {
@@ -582,8 +605,15 @@ func (rf *Raft) runElection(electionTerm int) bool {
 	}
 	rf.mu.Unlock()
 	mu_voted.Lock()
+	count := 0
 	for voted < (length+1)/2 {
+		if count == len(rf.peers)-1 {
+			mu_voted.Unlock()
+			prettydebug.Debug(prettydebug.DVote, "S%d election failed, election term: %d", rf.me, electionTerm)
+			return false
+		}
 		cond.Wait()
+		count++
 		rf.mu.Lock()
 		if rf.currentTerm > electionTerm {
 			rf.mu.Unlock()
@@ -598,7 +628,8 @@ func (rf *Raft) runElection(electionTerm int) bool {
 	rf.mu.Lock()
 	rf.state = leader
 	rf.currentTerm = electionTerm
-	rf.votedFor = rf.me                       //leader vote for itself
+	rf.votedFor = rf.me //leader vote for itself
+	rf.persist()
 	rf.nextIndex = make([]int, len(rf.peers)) //initialize nextindex and matchIndex
 	rf.matchIndex = make([]int, len(rf.peers))
 	for index := range rf.nextIndex {
@@ -639,6 +670,7 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 							// there exist server with higher term, change to follower
 							rf.currentTerm = replay.Term
 							rf.votedFor = -1
+							rf.persist()
 							rf.state = follower
 							prettydebug.Debug(prettydebug.DClient, "S%d is follower, term: %d", rf.me, rf.currentTerm)
 						}
@@ -675,6 +707,7 @@ func (rf *Raft) ticker() {
 			rf.state = candidate
 			rf.currentTerm = rf.currentTerm + 1
 			rf.votedFor = rf.me
+			rf.persist()
 			go rf.runElection(rf.currentTerm)
 		}
 		for rf.commitIndex > rf.lastApplied {
