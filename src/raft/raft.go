@@ -360,8 +360,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					}
 				}
 				prettydebug.Debug(prettydebug.DClient, "S%d PrevLogIndex PrevLogTerm don't match, log term: %d, rpc PrevLogTerm: %d, current term: %d", rf.me, rf.logTerm[args.PrevLogIndex], args.PrevLogTerm, rf.currentTerm)
-				rf.log = rf.log[:args.PrevLogIndex-1]
-				rf.logTerm = rf.logTerm[:args.PrevLogIndex-1]
+				rf.log = rf.log[:args.PrevLogIndex]         // this naturally excludes previous index
+				rf.logTerm = rf.logTerm[:args.PrevLogIndex] // this naturally excludes previous index
 				rf.persist()
 			} else { // every thing before match, append the new entries
 				reply.Success = true
@@ -370,7 +370,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.persist()
 				prettydebug.Debug(prettydebug.DClient, "S%d appending log entries: %d", rf.me, args.PrevLogIndex+1)
 				if args.LeaderCommit > rf.commitIndex {
-					rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+1+len(args.Entries))
+					rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
 				}
 			}
 		}
