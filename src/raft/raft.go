@@ -712,13 +712,16 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 // must run with mutex held
 func (rf *Raft) applyLog() {
 	for rf.commitIndex > rf.lastApplied {
-		rf.applyCh <- ApplyMsg{
+		appMsg := ApplyMsg{
 			CommandValid: true,
 			Command:      rf.log[rf.lastApplied+1],
 			CommandIndex: rf.lastApplied + 1, // command index start from 1 same as actual log start from 1
 		}
-		prettydebug.Debug(prettydebug.DLog, "S%d send log: %d to applyCh", rf.me, rf.log[rf.lastApplied+1])
 		rf.lastApplied = rf.lastApplied + 1
+		rf.mu.Unlock()
+		rf.applyCh <- appMsg
+		prettydebug.Debug(prettydebug.DLog, "S%d send log: %d to applyCh", rf.me, appMsg.Command)
+		rf.mu.Lock()
 	}
 }
 
