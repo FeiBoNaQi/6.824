@@ -220,18 +220,25 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 					rf.votedFor = args.CandidateID
 					rf.persist()
 					prettydebug.Debug(prettydebug.DVote, "S%d Vote, Vote for %d", rf.me, rf.votedFor)
-				} else { // request outdated
+				} else { // request outdated, same log term, but request index is lower
 					reply.VoteGranted = false
+					prettydebug.Debug(prettydebug.DVote, "S%d Vote, same term, I have longer index", rf.me)
 				}
-			} else { // request outdated
+			} else { // request outdated, request log term is lower
+				prettydebug.Debug(prettydebug.DVote, "S%d Vote, I have longer term", rf.me)
 				reply.VoteGranted = false
 			}
-		} else {
+		} else { // request term is same as server, but server already vote for someone else
+			prettydebug.Debug(prettydebug.DVote, "S%d Vote, I vote for %d, term %d", rf.me, rf.votedFor, rf.currentTerm)
 			reply.VoteGranted = false
 		}
 		reply.Term = args.Term
-		rf.currentTerm = args.Term
-		rf.persist()
+		if rf.currentTerm < args.Term {
+			rf.currentTerm = args.Term
+			rf.state = follower
+			rf.persist()
+		}
+
 	}
 }
 
