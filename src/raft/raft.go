@@ -208,6 +208,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			if args.LastLogTerm > rf.logTerm[len(rf.logTerm)-1] { // request more up to date
 				reply.VoteGranted = true
 				rf.state = follower
+				rf.cond.Broadcast()
 				rf.heartbeat = true
 				rf.votedFor = args.CandidateID
 				rf.persist()
@@ -216,6 +217,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				if args.LastLogIndex >= len(rf.log)-1 { // request more up to date
 					reply.VoteGranted = true
 					rf.state = follower
+					rf.cond.Broadcast()
 					rf.heartbeat = true
 					rf.votedFor = args.CandidateID
 					rf.persist()
@@ -236,6 +238,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if rf.currentTerm < args.Term {
 			rf.currentTerm = args.Term
 			rf.state = follower
+			rf.cond.Broadcast()
 			rf.persist()
 		}
 
@@ -318,6 +321,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.votedFor = args.LearderID // receive ping, only leader send ping message
 			rf.persist()
 			rf.state = follower
+			rf.cond.Broadcast()
 			reply.Term = args.Term
 			reply.Success = true
 			if args.LeaderCommit > rf.commitIndex {
@@ -332,6 +336,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.votedFor = args.LearderID // receive log replication, only leader send log replication message
 			rf.persist()
 			rf.state = follower
+			rf.cond.Broadcast()
 			reply.Term = args.Term
 			// PrevLogIndex outbound existing log
 			if len(rf.logTerm) < args.PrevLogIndex+1 {
@@ -450,7 +455,7 @@ func (rf *Raft) sendLogEntries(electedTerm int) {
 			for {
 				rf.mu.Lock()
 				// every thing commited, sleep in cond variable
-				for rf.nextIndex[i] == len(rf.log) {
+				for rf.nextIndex[i] == len(rf.log) && rf.state == leader {
 					rf.cond.Wait()
 				}
 				if !rf.checkLeadTerm(electedTerm) {
@@ -479,6 +484,7 @@ func (rf *Raft) sendLogEntries(electedTerm int) {
 						rf.votedFor = -1
 						rf.persist()
 						rf.state = follower
+						rf.cond.Broadcast()
 						prettydebug.Debug(prettydebug.DClient, "S%d is follower, term: %d", rf.me, rf.currentTerm)
 					} else if replay.Term == rf.currentTerm { //handle rpc reply
 						if replay.Success { // append entry successful
@@ -586,6 +592,7 @@ func (rf *Raft) runElection(electionTerm int) bool {
 							rf.mu.Lock()
 							if replay.Term > rf.currentTerm {
 								rf.state = follower
+								rf.cond.Broadcast()
 								rf.currentTerm = replay.Term
 								rf.votedFor = -1 // election was ended by a higher term, but we do not know who the leader is
 								rf.persist()
@@ -679,6 +686,7 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 							rf.votedFor = -1
 							rf.persist()
 							rf.state = follower
+							rf.cond.Broadcast()
 							prettydebug.Debug(prettydebug.DClient, "S%d is follower, term: %d", rf.me, rf.currentTerm)
 						}
 						// if the reply is no higher, simply release the lock, those reply means noting to leader
