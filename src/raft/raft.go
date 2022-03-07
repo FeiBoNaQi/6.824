@@ -472,7 +472,7 @@ func (rf *Raft) sendLogEntries(electedTerm int) {
 					Terms:        rf.logTerm[rf.nextIndex[i]:],
 					LeaderCommit: rf.commitIndex,
 				}
-				prettydebug.Debug(prettydebug.DLog, "S%d sends log%d to s%d, currurent term: %d", rf.me, rf.nextIndex[i], i, t)
+				prettydebug.Debug(prettydebug.DLog, "S%d sends log(%d-%d) to s%d, currurent term: %d", rf.me, rf.nextIndex[i], rf.nextIndex[i]+len(args.Entries)-1, i, t)
 				rf.mu.Unlock() // sendAppendEntries is blocking rpc, release the lock
 				ok := rf.sendAppendEntries(i, &args, &replay)
 				// to do
