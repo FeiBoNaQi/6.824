@@ -405,6 +405,60 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term      int
+	InstallOK bool
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term < rf.currentTerm { //Reply immediately if term < currentTerm
+		reply.Term = rf.currentTerm
+		reply.InstallOK = false
+		return
+	}
+	if args.LastIncludedIndex <= rf.snapshotIndex { //leader's snapshot lag behind servers
+		reply.Term = rf.currentTerm
+		reply.InstallOK = true
+		return
+	}
+	if args.LastIncludedIndex > len(rf.log)-1+rf.snapshotIndex { //leader's snapshot contain every log server has, discard every log
+		rf.log = rf.log[:0]
+		rf.logTerm = rf.logTerm[:0]
+	} else if rf.logTerm[args.LastIncludedIndex-rf.snapshotIndex] == args.LastIncludedTerm { //snapshot information match, retain every log behind snapshot
+		rf.log = rf.log[args.LastIncludedIndex-rf.snapshotIndex:]
+		rf.logTerm = rf.logTerm[args.LastIncludedIndex-rf.snapshotIndex:]
+	} else { //server's log lag behind leader's snapshot, discard every log
+		rf.log = rf.log[:0]
+		rf.logTerm = rf.logTerm[:0]
+	}
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	data := w.Bytes()
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logTerm)
+	e.Encode(rf.log)
+	rf.persister.SaveStateAndSnapshot(data, args.Data)
+	rf.snapshotIndex = args.LastIncludedIndex // every thing before index is removed from the log, but snapshot include terms in index
+	reply.Term = rf.currentTerm
+	reply.InstallOK = true
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
