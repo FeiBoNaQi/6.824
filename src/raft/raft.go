@@ -73,14 +73,15 @@ type Raft struct {
 	heartbeat   bool // true means receive heart beat
 	state       string
 	// 2B log repelication
-	commitIndex int
-	lastApplied int
-	nextIndex   []int // index 1 point to first log, index 0 kept as a starting point for logic comparison, index 0 has term 0
-	matchIndex  []int
-	logTerm     []int // every server as a log term history //persist state
-	cond        sync.Cond
-	log         []interface{} //persist state
-	applyCh     chan ApplyMsg
+	commitIndex   int
+	lastApplied   int
+	nextIndex     []int // index 1 point to first log, index 0 kept as a starting point for logic comparison, index 0 has term 0
+	matchIndex    []int
+	logTerm       []int // every server as a log term history //persist state
+	cond          sync.Cond
+	log           []interface{} //persist state
+	applyCh       chan ApplyMsg
+	snapshotIndex int
 }
 
 // return currentTerm and whether this server
@@ -115,6 +116,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.votedFor)
 	e.Encode(rf.logTerm)
 	e.Encode(rf.log)
+	e.Encode(rf.snapshotIndex)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -134,10 +136,12 @@ func (rf *Raft) readPersist(data []byte) {
 	var votedFor int
 	var logTerm []int
 	var log []interface{}
+	var snapshotIndex int
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
 		d.Decode(&logTerm) != nil ||
-		d.Decode(&log) != nil {
+		d.Decode(&log) != nil ||
+		d.Decode(&snapshotIndex) != nil {
 		prettydebug.Debug(prettydebug.DError, "S%d failed reload persistent state", rf.me)
 	} else {
 		rf.mu.Lock()
@@ -146,6 +150,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.votedFor = votedFor
 		rf.logTerm = logTerm
 		rf.log = log
+		rf.snapshotIndex = snapshotIndex
 	}
 }
 
@@ -156,7 +161,6 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
-
 	return true
 }
 
@@ -166,7 +170,19 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logTerm[index-rf.snapshotIndex:])
+	e.Encode(rf.log[index-rf.snapshotIndex:])
+	data := w.Bytes()
+	rf.persister.SaveStateAndSnapshot(data, snapshot)
+	rf.logTerm = rf.logTerm[index-rf.snapshotIndex:]
+	rf.log = rf.log[index-rf.snapshotIndex:]
+	rf.snapshotIndex = index // every thing before index is removed from the log, but snapshot include terms in index
 }
 
 //
@@ -214,7 +230,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				rf.persist()
 				prettydebug.Debug(prettydebug.DVote, "S%d Vote, Vote for %d", rf.me, rf.votedFor)
 			} else if args.LastLogTerm == rf.logTerm[len(rf.logTerm)-1] {
-				if args.LastLogIndex >= len(rf.log)-1 { // request more up to date
+				if args.LastLogIndex >= len(rf.log)-1+rf.snapshotIndex { // request more up to date
 					reply.VoteGranted = true
 					rf.state = follower
 					rf.cond.Broadcast()
@@ -325,7 +341,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Term = args.Term
 			reply.Success = true
 			if args.LeaderCommit > rf.commitIndex {
-				if (len(rf.logTerm) >= args.PrevLogIndex+1) && (rf.logTerm[args.PrevLogIndex] == args.PrevLogTerm) {
+				if (len(rf.logTerm)+rf.snapshotIndex >= args.PrevLogIndex+1) && (rf.logTerm[args.PrevLogIndex-rf.snapshotIndex] == args.PrevLogTerm) {
 					rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex)
 					rf.applyLog()
 				}
@@ -340,7 +356,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.cond.Broadcast()
 			reply.Term = args.Term
 			// PrevLogIndex outbound existing log
-			if len(rf.logTerm) < args.PrevLogIndex+1 {
+			if len(rf.logTerm)+rf.snapshotIndex < args.PrevLogIndex+1 {
 				reply.Success = false
 				// reply.MisMatchTerm = rf.logTerm[len(rf.logTerm)-1]
 				// for i := len(rf.logTerm) - 1; i > 0; i-- {
@@ -349,25 +365,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				// 		break
 				// 	}
 				// }
-				reply.MisMatchTermStartIndex = len(rf.logTerm)
+				reply.MisMatchTermStartIndex = len(rf.logTerm) + rf.snapshotIndex
 				prettydebug.Debug(prettydebug.DClient, "S%d PrevLogIndex outbound existing log, log number: %d, rpc PrevLogIndex: %d, term: %d", rf.me, len(rf.logTerm), args.PrevLogIndex, rf.currentTerm)
-			} else if rf.logTerm[args.PrevLogIndex] != args.PrevLogTerm { // PrevLogTerm don't match
+			} else if rf.logTerm[args.PrevLogIndex-rf.snapshotIndex] != args.PrevLogTerm { // PrevLogTerm don't match
 				reply.Success = false
-				MisMatchTerm := rf.logTerm[args.PrevLogIndex]
-				for i := args.PrevLogIndex - 1; i >= 0; i-- {
+				MisMatchTerm := rf.logTerm[args.PrevLogIndex-rf.snapshotIndex]
+				for i := args.PrevLogIndex - 1 - rf.snapshotIndex; i >= 0; i-- {
 					if rf.logTerm[i] != MisMatchTerm {
 						reply.MisMatchTermStartIndex = i + 1
 						break
 					}
 				}
-				prettydebug.Debug(prettydebug.DClient, "S%d PrevLogIndex PrevLogTerm don't match, log term: %d, rpc PrevLogTerm: %d, current term: %d", rf.me, rf.logTerm[args.PrevLogIndex], args.PrevLogTerm, rf.currentTerm)
-				rf.log = rf.log[:args.PrevLogIndex]         // this naturally excludes previous index
-				rf.logTerm = rf.logTerm[:args.PrevLogIndex] // this naturally excludes previous index
+				prettydebug.Debug(prettydebug.DClient, "S%d PrevLogIndex PrevLogTerm don't match, log term: %d, rpc PrevLogTerm: %d, current term: %d", rf.me, rf.logTerm[args.PrevLogIndex-rf.snapshotIndex], args.PrevLogTerm, rf.currentTerm)
+				rf.log = rf.log[:args.PrevLogIndex-rf.snapshotIndex]         // this naturally excludes previous index
+				rf.logTerm = rf.logTerm[:args.PrevLogIndex-rf.snapshotIndex] // this naturally excludes previous index
 				rf.persist()
 			} else { // every thing before match, append the new entries
 				reply.Success = true
-				rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
-				rf.logTerm = append(rf.logTerm[:args.PrevLogIndex+1], args.Terms...)
+				rf.log = append(rf.log[:args.PrevLogIndex+1-rf.snapshotIndex], args.Entries...)
+				rf.logTerm = append(rf.logTerm[:args.PrevLogIndex+1-rf.snapshotIndex], args.Terms...)
 				rf.persist()
 				prettydebug.Debug(prettydebug.DClient, "S%d appending log entries: %d", rf.me, args.PrevLogIndex+1)
 				if args.LeaderCommit > rf.commitIndex {
@@ -420,7 +436,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.log = append(rf.log, command)
 	rf.logTerm = append(rf.logTerm, rf.currentTerm)
 	rf.persist()
-	index = len(rf.log) - 1
+	index = len(rf.log) - 1 + rf.snapshotIndex
 	term = rf.currentTerm
 	isLeader = true
 	rf.cond.Broadcast()
@@ -469,9 +485,9 @@ func (rf *Raft) sendLogEntries(electedTerm int) {
 					Term:         t,
 					LearderID:    rf.me,
 					PrevLogIndex: rf.nextIndex[i] - 1,
-					PrevLogTerm:  rf.logTerm[rf.nextIndex[i]-1],
-					Entries:      rf.log[rf.nextIndex[i]:],
-					Terms:        rf.logTerm[rf.nextIndex[i]:],
+					PrevLogTerm:  rf.logTerm[rf.nextIndex[i]-1-rf.snapshotIndex],
+					Entries:      rf.log[rf.nextIndex[i]-rf.snapshotIndex:],
+					Terms:        rf.logTerm[rf.nextIndex[i]-rf.snapshotIndex:],
 					LeaderCommit: rf.commitIndex,
 				}
 				prettydebug.Debug(prettydebug.DLog, "S%d sends log(%d-%d) to s%d, currurent term: %d", rf.me, rf.nextIndex[i], rf.nextIndex[i]+len(args.Entries)-1, i, t)
@@ -495,7 +511,7 @@ func (rf *Raft) sendLogEntries(electedTerm int) {
 							prettydebug.Debug(prettydebug.DClient, "S%d server%d,match index: %d, commit index: %d, term: %d", rf.me, i, rf.matchIndex[i], rf.commitIndex, rf.currentTerm)
 
 							// loop through peers to check if commitIndex need update
-							if rf.matchIndex[i] > rf.commitIndex && rf.logTerm[rf.matchIndex[i]] == rf.currentTerm {
+							if rf.matchIndex[i] > rf.commitIndex && rf.logTerm[rf.matchIndex[i]-rf.snapshotIndex] == rf.currentTerm {
 								count := 0
 								for peerIndex := range rf.peers {
 									if rf.matchIndex[peerIndex] >= rf.matchIndex[i] {
@@ -617,7 +633,7 @@ func (rf *Raft) runElection(electionTerm int) bool {
 						}
 					}
 				}
-			}(index, electionTerm, rf.me, len(rf.log)-1, rf.logTerm[len(rf.log)-1])
+			}(index, electionTerm, rf.me, len(rf.log)-1+rf.snapshotIndex, rf.logTerm[len(rf.log)-1-rf.snapshotIndex])
 		}
 	}
 	rf.mu.Unlock()
@@ -650,7 +666,7 @@ func (rf *Raft) runElection(electionTerm int) bool {
 	rf.nextIndex = make([]int, len(rf.peers)) //initialize nextindex and matchIndex
 	rf.matchIndex = make([]int, len(rf.peers))
 	for index := range rf.nextIndex {
-		rf.nextIndex[index] = len(rf.log)
+		rf.nextIndex[index] = len(rf.log) + rf.snapshotIndex
 	}
 	prettydebug.Debug(prettydebug.DLeader, "S%d becomes Leader, currurent term: %d", rf.me, electionTerm)
 	go rf.sendHeartBeat(electionTerm)
@@ -675,7 +691,7 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 						Term:         t,
 						LearderID:    rf.me,
 						PrevLogIndex: rf.nextIndex[i] - 1,
-						PrevLogTerm:  rf.logTerm[rf.nextIndex[i]-1],
+						PrevLogTerm:  rf.logTerm[rf.nextIndex[i]-1-rf.snapshotIndex],
 						LeaderCommit: rf.commitIndex,
 					}
 					rf.mu.Unlock()
@@ -714,7 +730,7 @@ func (rf *Raft) applyLog() {
 	for rf.commitIndex > rf.lastApplied {
 		appMsg := ApplyMsg{
 			CommandValid: true,
-			Command:      rf.log[rf.lastApplied+1],
+			Command:      rf.log[rf.lastApplied+1-rf.snapshotIndex],
 			CommandIndex: rf.lastApplied + 1, // command index start from 1 same as actual log start from 1
 		}
 		rf.lastApplied = rf.lastApplied + 1
@@ -786,6 +802,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.logTerm = append(rf.logTerm, 0) // logTerm[0] default to 0
 	rf.log = append(rf.log, 0)         // log[0] default to 0
 	rf.applyCh = applyCh
+	rf.snapshotIndex = 0
 	rf.mu.Unlock()
 
 	// initialize from state persisted before a crash
