@@ -341,7 +341,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.cond.Broadcast()
 			reply.Term = args.Term
 			reply.Success = true
-			if args.LeaderCommit > rf.commitIndex {
+			// only entering if when args.PrevLogIndex > rf.commitIndex >= rf.snapshotIndex
+			// ensuring rf.logTerm[args.PrevLogIndex-rf.snapshotIndex] index within bound
+			if args.LeaderCommit > rf.commitIndex && args.PrevLogIndex > rf.commitIndex {
 				if (len(rf.logTerm)+rf.snapshotIndex >= args.PrevLogIndex+1) && (rf.logTerm[args.PrevLogIndex-rf.snapshotIndex] == args.PrevLogTerm) {
 					rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex)
 					rf.applyLog()
@@ -592,7 +594,13 @@ func (rf *Raft) sendLogEntries(electedTerm int) {
 					return
 				}
 				if rf.nextIndex[i]-1-rf.snapshotIndex < 0 { // leader's snapshot goes beyond server next log entry
-					rf.sendSnapshot(i, t, rf.snapshotIndex, rf.logTerm[0], rf.log[0], rf.persister.ReadSnapshot())
+					coCh := make(chan int)
+					go func(i int, t int, snapshotIndex int, logTerm int, log interface{}, snapshot []byte) {
+						rf.sendSnapshot(i, t, snapshotIndex, logTerm, log, snapshot)
+						coCh <- 1
+					}(i, t, rf.snapshotIndex, rf.logTerm[0], rf.log[0], rf.persister.ReadSnapshot())
+					rf.mu.Unlock()
+					<-coCh
 					continue
 				}
 				replay := AppendEntriesReply{}
@@ -748,7 +756,7 @@ func (rf *Raft) runElection(electionTerm int) bool {
 						}
 					}
 				}
-			}(index, electionTerm, rf.me, len(rf.log)-1+rf.snapshotIndex, rf.logTerm[len(rf.log)-1-rf.snapshotIndex])
+			}(index, electionTerm, rf.me, len(rf.log)-1+rf.snapshotIndex, rf.logTerm[len(rf.log)-1]) // last log term are determined by len(rf.log) -1
 		}
 	}
 	rf.mu.Unlock()
@@ -812,7 +820,7 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 						args.PrevLogTerm = rf.logTerm[rf.nextIndex[i]-1-rf.snapshotIndex]
 					} else {
 						args.PrevLogTerm = -1 // leader's snapshot goes beyond server next log entry
-						go rf.sendSnapshot(i, t, rf.snapshotIndex, rf.logTerm[0], rf.log[0], rf.persister.ReadSnapshot())
+						// go rf.sendSnapshot(i, t, rf.snapshotIndex, rf.logTerm[0], rf.log[0], rf.persister.ReadSnapshot())
 					}
 					rf.mu.Unlock()
 					prettydebug.Debug(prettydebug.DLeader, "S%d ping s%d, currurent term: %d", rf.me, i, t)
