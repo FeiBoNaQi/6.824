@@ -385,7 +385,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.log = append(rf.log[:args.PrevLogIndex+1-rf.snapshotIndex], args.Entries...)
 				rf.logTerm = append(rf.logTerm[:args.PrevLogIndex+1-rf.snapshotIndex], args.Terms...)
 				rf.persist()
-				prettydebug.Debug(prettydebug.DClient, "S%d appending log entries: %d", rf.me, args.PrevLogIndex+1)
+				prettydebug.Debug(prettydebug.DLog, "S%d appending log entries: %d", rf.me, args.PrevLogIndex+1)
 				if args.LeaderCommit > rf.commitIndex {
 					rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
 					rf.applyLog()
@@ -410,6 +410,7 @@ type InstallSnapshotArgs struct {
 	LeaderId          int
 	LastIncludedIndex int
 	LastIncludedTerm  int
+	LastIncludedLog   interface{}
 	Data              []byte
 }
 
@@ -434,12 +435,16 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if args.LastIncludedIndex > len(rf.log)-1+rf.snapshotIndex { //leader's snapshot contain every log server has, discard every log
 		rf.log = rf.log[:0]
 		rf.logTerm = rf.logTerm[:0]
+		rf.log = append(rf.log, args.LastIncludedLog)
+		rf.logTerm = append(rf.logTerm, args.LastIncludedTerm)
 	} else if rf.logTerm[args.LastIncludedIndex-rf.snapshotIndex] == args.LastIncludedTerm { //snapshot information match, retain every log behind snapshot
 		rf.log = rf.log[args.LastIncludedIndex-rf.snapshotIndex:]
 		rf.logTerm = rf.logTerm[args.LastIncludedIndex-rf.snapshotIndex:]
 	} else { //server's log lag behind leader's snapshot, discard every log
 		rf.log = rf.log[:0]
 		rf.logTerm = rf.logTerm[:0]
+		rf.log = append(rf.log, args.LastIncludedLog)
+		rf.logTerm = append(rf.logTerm, args.LastIncludedTerm)
 	}
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -450,13 +455,49 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	e.Encode(rf.log)
 	rf.persister.SaveStateAndSnapshot(data, args.Data)
 	rf.snapshotIndex = args.LastIncludedIndex // every thing before index is removed from the log, but snapshot include terms in index
+	rf.commitIndex = max(rf.commitIndex, args.LastIncludedIndex)
+	rf.lastApplied = max(rf.lastApplied, args.LastIncludedIndex)
 	reply.Term = rf.currentTerm
 	reply.InstallOK = true
+	prettydebug.Debug(prettydebug.DSnap, "S%d install snapshotIndex:%d, commit index:%d, lastApplied:%d", rf.me, rf.snapshotIndex, rf.commitIndex, rf.lastApplied)
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
 	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
+}
+
+// @server index of the server receive snapshot
+func (rf *Raft) sendSnapshot(server int, term int, lastIncludedIndex int, LastIncludedTerm int, lastIncludedLog interface{}, data []byte) {
+	args := InstallSnapshotArgs{
+		Term:              term,
+		LeaderId:          rf.me,
+		LastIncludedIndex: lastIncludedIndex,
+		LastIncludedTerm:  LastIncludedTerm,
+		LastIncludedLog:   lastIncludedLog,
+		Data:              data,
+	}
+	reply := InstallSnapshotReply{}
+	ok := rf.sendInstallSnapshot(server, &args, &reply)
+	if ok { // send snapshot sucessful
+		rf.mu.Lock()
+		if reply.InstallOK { //server install snapshot sucessful
+			rf.matchIndex[server] = max(lastIncludedIndex, rf.matchIndex[server])
+			rf.nextIndex[server] = rf.matchIndex[server] + 1
+		} else { // server install snapshot failed
+			if reply.Term > rf.currentTerm {
+				rf.currentTerm = reply.Term
+				rf.votedFor = -1
+				rf.persist()
+				rf.state = follower
+				rf.cond.Broadcast()
+				prettydebug.Debug(prettydebug.DClient, "S%d is follower, term: %d", rf.me, rf.currentTerm)
+			}
+		}
+		rf.mu.Unlock()
+	} else {
+		prettydebug.Debug(prettydebug.DWarn, "S%d send snapshot to S%d failed, term: %d", rf.me, server, term)
+	}
 }
 
 //
@@ -527,12 +568,16 @@ func (rf *Raft) sendLogEntries(electedTerm int) {
 			for {
 				rf.mu.Lock()
 				// every thing commited, sleep in cond variable
-				for rf.nextIndex[i] == len(rf.log) && rf.state == leader {
+				for rf.nextIndex[i] == len(rf.log)+rf.snapshotIndex && rf.state == leader {
 					rf.cond.Wait()
 				}
 				if !rf.checkLeadTerm(electedTerm) {
 					rf.mu.Unlock()
 					return
+				}
+				if rf.nextIndex[i]-1-rf.snapshotIndex < 0 { // leader's snapshot goes beyond server next log entry
+					rf.sendSnapshot(i, t, rf.snapshotIndex, rf.logTerm[0], rf.log[0], rf.persister.ReadSnapshot())
+					continue
 				}
 				replay := AppendEntriesReply{}
 				args := AppendEntriesArgs{
@@ -745,8 +790,13 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 						Term:         t,
 						LearderID:    rf.me,
 						PrevLogIndex: rf.nextIndex[i] - 1,
-						PrevLogTerm:  rf.logTerm[rf.nextIndex[i]-1-rf.snapshotIndex],
 						LeaderCommit: rf.commitIndex,
+					}
+					if rf.nextIndex[i]-1-rf.snapshotIndex > 0 {
+						args.PrevLogTerm = rf.logTerm[rf.nextIndex[i]-1-rf.snapshotIndex]
+					} else {
+						args.PrevLogTerm = -1 // leader's snapshot goes beyond server next log entry
+						go rf.sendSnapshot(i, t, rf.snapshotIndex, rf.logTerm[0], rf.log[0], rf.persister.ReadSnapshot())
 					}
 					rf.mu.Unlock()
 					prettydebug.Debug(prettydebug.DLeader, "S%d ping s%d, currurent term: %d", rf.me, i, t)
