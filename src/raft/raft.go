@@ -151,6 +151,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.logTerm = logTerm
 		rf.log = log
 		rf.snapshotIndex = snapshotIndex
+		rf.lastApplied = snapshotIndex
 	}
 }
 
@@ -462,6 +463,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.snapshotIndex = args.LastIncludedIndex // every thing before index is removed from the log, but snapshot include terms in index
 	rf.commitIndex = max(rf.commitIndex, args.LastIncludedIndex)
 	rf.lastApplied = max(rf.lastApplied, args.LastIncludedIndex)
+	rf.state = follower
 	reply.Term = rf.currentTerm
 	reply.InstallOK = true
 
@@ -816,11 +818,18 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 						PrevLogIndex: rf.nextIndex[i] - 1,
 						LeaderCommit: rf.commitIndex,
 					}
-					if rf.nextIndex[i]-1-rf.snapshotIndex > 0 {
+					if rf.nextIndex[i]-1-rf.snapshotIndex >= 0 {
 						args.PrevLogTerm = rf.logTerm[rf.nextIndex[i]-1-rf.snapshotIndex]
 					} else {
 						args.PrevLogTerm = -1 // leader's snapshot goes beyond server next log entry
-						// go rf.sendSnapshot(i, t, rf.snapshotIndex, rf.logTerm[0], rf.log[0], rf.persister.ReadSnapshot())
+						coCh := make(chan int)
+						go func(i int, t int, snapshotIndex int, logTerm int, log interface{}, snapshot []byte) {
+							rf.sendSnapshot(i, t, snapshotIndex, logTerm, log, snapshot)
+							coCh <- 1
+						}(i, t, rf.snapshotIndex, rf.logTerm[0], rf.log[0], rf.persister.ReadSnapshot())
+						rf.mu.Unlock()
+						<-coCh
+						return
 					}
 					rf.mu.Unlock()
 					prettydebug.Debug(prettydebug.DLeader, "S%d ping s%d, currurent term: %d", rf.me, i, t)
