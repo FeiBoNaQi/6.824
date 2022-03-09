@@ -178,6 +178,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	e.Encode(rf.votedFor)
 	e.Encode(rf.logTerm[index-rf.snapshotIndex:])
 	e.Encode(rf.log[index-rf.snapshotIndex:])
+	e.Encode(rf.snapshotIndex)
 	data := w.Bytes()
 	rf.persister.SaveStateAndSnapshot(data, snapshot)
 	rf.logTerm = rf.logTerm[index-rf.snapshotIndex:]
@@ -421,15 +422,16 @@ type InstallSnapshotReply struct {
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	if args.Term < rf.currentTerm { //Reply immediately if term < currentTerm
 		reply.Term = rf.currentTerm
 		reply.InstallOK = false
+		rf.mu.Unlock()
 		return
 	}
 	if args.LastIncludedIndex <= rf.snapshotIndex { //leader's snapshot lag behind servers
 		reply.Term = rf.currentTerm
 		reply.InstallOK = true
+		rf.mu.Unlock()
 		return
 	}
 	if args.LastIncludedIndex > len(rf.log)-1+rf.snapshotIndex { //leader's snapshot contain every log server has, discard every log
@@ -453,13 +455,27 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	e.Encode(rf.votedFor)
 	e.Encode(rf.logTerm)
 	e.Encode(rf.log)
+	e.Encode(rf.snapshotIndex)
 	rf.persister.SaveStateAndSnapshot(data, args.Data)
 	rf.snapshotIndex = args.LastIncludedIndex // every thing before index is removed from the log, but snapshot include terms in index
 	rf.commitIndex = max(rf.commitIndex, args.LastIncludedIndex)
 	rf.lastApplied = max(rf.lastApplied, args.LastIncludedIndex)
 	reply.Term = rf.currentTerm
 	reply.InstallOK = true
+
+	appMsg := ApplyMsg{
+		CommandValid: false,
+		//Command:       useless term, do not initialize
+		//CommandIndex:  useless term, do not initialize
+		SnapshotValid: true,
+		Snapshot:      args.Data,
+		SnapshotTerm:  args.LastIncludedTerm,
+		SnapshotIndex: args.LastIncludedIndex,
+	}
+	rf.mu.Unlock()
+	rf.applyCh <- appMsg
 	prettydebug.Debug(prettydebug.DSnap, "S%d install snapshotIndex:%d, commit index:%d, lastApplied:%d", rf.me, rf.snapshotIndex, rf.commitIndex, rf.lastApplied)
+
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
