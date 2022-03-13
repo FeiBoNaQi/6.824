@@ -59,6 +59,7 @@ type ApplyMsg struct {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
+	chMu      sync.Mutex          // lock to protect applyCh
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
@@ -482,8 +483,10 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		SnapshotTerm:  args.LastIncludedTerm,
 		SnapshotIndex: args.LastIncludedIndex,
 	}
+	rf.chMu.Lock()
 	rf.mu.Unlock()
 	rf.applyCh <- appMsg
+	rf.chMu.Unlock()
 	prettydebug.Debug(prettydebug.DSnap, "S%d install snapshotIndex:%d, commit index:%d, lastApplied:%d", rf.me, rf.snapshotIndex, rf.commitIndex, rf.lastApplied)
 
 }
@@ -911,8 +914,10 @@ func (rf *Raft) applyLog() {
 			CommandIndex: rf.lastApplied + 1, // command index start from 1 same as actual log start from 1
 		}
 		rf.lastApplied = rf.lastApplied + 1
+		rf.chMu.Lock()
 		rf.mu.Unlock()
 		rf.applyCh <- appMsg
+		rf.chMu.Unlock()
 		prettydebug.Debug(prettydebug.DLog, "S%d send log: %d to applyCh", rf.me, appMsg.Command)
 		rf.mu.Lock()
 	}
