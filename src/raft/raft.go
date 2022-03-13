@@ -179,7 +179,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	e.Encode(rf.votedFor)
 	e.Encode(rf.logTerm[index-rf.snapshotIndex:])
 	e.Encode(rf.log[index-rf.snapshotIndex:])
-	e.Encode(rf.snapshotIndex)
+	e.Encode(index)
 	data := w.Bytes()
 	rf.persister.SaveStateAndSnapshot(data, snapshot)
 	rf.logTerm = rf.logTerm[index-rf.snapshotIndex:]
