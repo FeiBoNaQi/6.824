@@ -570,6 +570,9 @@ func (rf *Raft) checkLeadTerm(electedTerm int) bool {
 		prettydebug.Debug(prettydebug.DLog2, "S%d current term: %d, elected term: %d, stop sending log entries", rf.me, rf.currentTerm, electedTerm)
 		return false
 	}
+	if rf.killed() {
+		return false
+	}
 	return true
 }
 
@@ -587,8 +590,12 @@ func (rf *Raft) sendLogEntries(electedTerm int) {
 		go func(i int, t int) {
 			for {
 				rf.mu.Lock()
+				if rf.killed() {
+					rf.mu.Unlock()
+					return
+				}
 				// every thing commited, sleep in cond variable
-				for rf.nextIndex[i] == len(rf.log)+rf.snapshotIndex && rf.state == leader {
+				for rf.nextIndex[i] == len(rf.log)+rf.snapshotIndex && rf.state == leader && !rf.killed() {
 					rf.cond.Wait()
 				}
 				if !rf.checkLeadTerm(t) {
@@ -703,7 +710,7 @@ func (rf *Raft) runElection(electionTerm int) bool {
 			if index == rf.me {
 				continue
 			}
-			go func(i int, t int, m int, lli int, llt int) bool {
+			go func(i int, t int, m int, lli int, llt int) {
 				var backoff time.Duration = 1
 				for {
 					replay := RequestVoteReply{}
@@ -715,10 +722,15 @@ func (rf *Raft) runElection(electionTerm int) bool {
 					}
 
 					rf.mu.Lock() //check again that code is still electing
+					if rf.killed() {
+						cond.Signal()
+						rf.mu.Unlock()
+						return
+					}
 					if rf.currentTerm != t || rf.state != candidate {
 						cond.Signal()
 						rf.mu.Unlock()
-						return false
+						return
 					}
 					rf.mu.Unlock()
 
@@ -730,7 +742,7 @@ func (rf *Raft) runElection(electionTerm int) bool {
 							prettydebug.Debug(prettydebug.DVote, "S%d receive votes from server%d, term: %d", m, i, t)
 							mu_voted.Unlock()
 							cond.Signal()
-							return true
+							return
 						} else if replay.Term > t {
 							// entering follower state
 							rf.mu.Lock()
@@ -743,11 +755,11 @@ func (rf *Raft) runElection(electionTerm int) bool {
 							}
 							rf.mu.Unlock()
 							cond.Signal()
-							return false
+							return
 						} else if replay.Term == t {
 							// peer's vote already gives to others
 							cond.Signal()
-							return false
+							return
 						}
 					} else {
 						time.Sleep(backoff * 10 * time.Millisecond)
@@ -779,6 +791,11 @@ func (rf *Raft) runElection(electionTerm int) bool {
 			prettydebug.Debug(prettydebug.DVote, "S%d election failed, election term: %d", rf.me, electionTerm)
 			return false
 		}
+		if rf.killed() {
+			rf.mu.Unlock()
+			mu_voted.Unlock()
+			return false
+		}
 		rf.mu.Unlock()
 	}
 	mu_voted.Unlock()
@@ -802,7 +819,7 @@ func (rf *Raft) runElection(electionTerm int) bool {
 
 func (rf *Raft) sendHeartBeat(electedTerm int) {
 	rf.mu.Lock()
-	for rf.currentTerm == electedTerm && rf.state == leader {
+	for rf.currentTerm == electedTerm && rf.state == leader && !rf.killed() {
 		for index := range rf.peers {
 			// do not send rpc to candidate server itself
 			if index == rf.me {
@@ -864,7 +881,7 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 
 // must run with mutex held
 func (rf *Raft) applyLog() {
-	for rf.commitIndex > rf.lastApplied {
+	for rf.commitIndex > rf.lastApplied && !rf.killed() {
 		appMsg := ApplyMsg{
 			CommandValid: true,
 			Command:      rf.log[rf.lastApplied+1-rf.snapshotIndex],
