@@ -369,18 +369,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				// 		break
 				// 	}
 				// }
-				reply.MisMatchTermStartIndex = len(rf.logTerm) + rf.snapshotIndex
-				prettydebug.Debug(prettydebug.DClient, "S%d PrevLogIndex outbound existing log, log number: %d, rpc PrevLogIndex: %d, term: %d", rf.me, len(rf.logTerm), args.PrevLogIndex, rf.currentTerm)
+				for i := len(rf.logTerm) - 1; i >= 0; i-- {
+					if rf.logTerm[i] <= args.PrevLogTerm {
+						reply.MisMatchTermStartIndex = i + 1 + rf.snapshotIndex
+						break
+					}
+				}
+				prettydebug.Debug(prettydebug.DClient, "S%d PrevLogIndex outbound existing log, log number: %d, rpc PrevLogIndex: %d, term: %d, MisMatchTermStartIndex:%d", rf.me, len(rf.logTerm), args.PrevLogIndex, rf.currentTerm, reply.MisMatchTermStartIndex)
 			} else if rf.logTerm[args.PrevLogIndex-rf.snapshotIndex] != args.PrevLogTerm { // PrevLogTerm don't match
 				reply.Success = false
 				MisMatchTerm := rf.logTerm[args.PrevLogIndex-rf.snapshotIndex]
 				for i := args.PrevLogIndex - 1 - rf.snapshotIndex; i >= 0; i-- {
-					if rf.logTerm[i] != MisMatchTerm {
+					if rf.logTerm[i] != MisMatchTerm && rf.logTerm[i] <= args.PrevLogTerm {
 						reply.MisMatchTermStartIndex = i + 1
 						break
 					}
 				}
-				prettydebug.Debug(prettydebug.DClient, "S%d PrevLogIndex PrevLogTerm don't match, log term: %d, rpc PrevLogTerm: %d, current term: %d", rf.me, rf.logTerm[args.PrevLogIndex-rf.snapshotIndex], args.PrevLogTerm, rf.currentTerm)
+				prettydebug.Debug(prettydebug.DClient, "S%d PrevLogIndex PrevLogTerm don't match, log term: %d, rpc PrevLogTerm: %d, current term: %d, MisMatchTermStartIndex:%d", rf.me, rf.logTerm[args.PrevLogIndex-rf.snapshotIndex], args.PrevLogTerm, rf.currentTerm, reply.MisMatchTermStartIndex)
 				rf.log = rf.log[:args.PrevLogIndex-rf.snapshotIndex]         // this naturally excludes previous index
 				rf.logTerm = rf.logTerm[:args.PrevLogIndex-rf.snapshotIndex] // this naturally excludes previous index
 				rf.persist()
@@ -464,6 +469,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.commitIndex = max(rf.commitIndex, args.LastIncludedIndex)
 	rf.lastApplied = max(rf.lastApplied, args.LastIncludedIndex)
 	rf.state = follower
+	rf.heartbeat = true
 	reply.Term = rf.currentTerm
 	reply.InstallOK = true
 
@@ -498,6 +504,7 @@ func (rf *Raft) sendSnapshot(server int, term int, lastIncludedIndex int, LastIn
 		Data:              data,
 	}
 	reply := InstallSnapshotReply{}
+	prettydebug.Debug(prettydebug.DSnap, "S%d sends snapshot%d to s%d, currurent term: %d", rf.me, rf.snapshotIndex, server, term)
 	ok := rf.sendInstallSnapshot(server, &args, &reply)
 	if ok { // send snapshot sucessful
 		rf.mu.Lock()
@@ -624,7 +631,22 @@ func (rf *Raft) sendLogEntries(electedTerm int) {
 				}
 				prettydebug.Debug(prettydebug.DLog, "S%d sends log(%d-%d) to s%d, currurent term: %d", rf.me, rf.nextIndex[i], rf.nextIndex[i]+len(args.Entries)-1, i, t)
 				rf.mu.Unlock() // sendAppendEntries is blocking rpc, release the lock
-				ok := rf.sendAppendEntries(i, &args, &replay)
+				var ok bool
+				c1 := make(chan bool, 1)
+				// Run your long running function in it's own goroutine and pass back it's
+				// response into our channel.
+				go func(i int, pargs *AppendEntriesArgs, preply *AppendEntriesReply) {
+					ok := rf.sendAppendEntries(i, pargs, preply)
+					c1 <- ok
+				}(i, &args, &replay)
+
+				// Listen on our channel AND a timeout channel - which ever happens first.
+				select {
+				case ok = <-c1:
+				case <-time.After(1 * time.Second):
+					ok = false
+					prettydebug.Debug(prettydebug.DLog, "S%d log replication for %d timeout", rf.me, args.PrevLogIndex+1)
+				}
 				// to do
 				// use heart beat to decide if we should send next ping message
 				if ok {
@@ -873,7 +895,8 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 			}(index, electedTerm, rf.me)
 		}
 		rf.mu.Unlock()
-		time.Sleep(110 * time.Millisecond)
+		rf.cond.Broadcast()
+		time.Sleep(150 * time.Millisecond)
 		rf.mu.Lock()
 	}
 	rf.mu.Unlock()
@@ -917,7 +940,7 @@ func (rf *Raft) ticker() {
 		rf.applyLog()
 		rf.heartbeat = false
 		rf.mu.Unlock()
-		time.Sleep(time.Duration(150+300*rand.Float32()) * time.Millisecond)
+		time.Sleep(time.Duration(450+150*rand.Float32()) * time.Millisecond)
 		rf.mu.Lock()
 	}
 	rf.mu.Unlock()
