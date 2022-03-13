@@ -591,7 +591,7 @@ func (rf *Raft) sendLogEntries(electedTerm int) {
 				for rf.nextIndex[i] == len(rf.log)+rf.snapshotIndex && rf.state == leader {
 					rf.cond.Wait()
 				}
-				if !rf.checkLeadTerm(electedTerm) {
+				if !rf.checkLeadTerm(t) {
 					rf.mu.Unlock()
 					return
 				}
@@ -651,13 +651,13 @@ func (rf *Raft) sendLogEntries(electedTerm int) {
 						} else { // append entry failed
 							rf.nextIndex[i] = replay.MisMatchTermStartIndex
 						}
-					} else if replay.Term < electedTerm {
+					} else if replay.Term < t {
 						panic("reply term can not be smaller than current term")
 					}
 					// if the reply is no higher, simply release the lock, those reply means noting to leader
 					rf.mu.Unlock()
 				} else {
-					prettydebug.Debug(prettydebug.DWarn, "S%d send sendLogEntries to S%d failed, term: %d", rf.me, i, electedTerm)
+					prettydebug.Debug(prettydebug.DWarn, "S%d send sendLogEntries to S%d failed, term: %d", rf.me, i, t)
 					time.Sleep(110 * time.Millisecond)
 				}
 			}
@@ -810,7 +810,7 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 			}
 			go func(i int, t int, m int) {
 				rf.mu.Lock()
-				if rf.state == leader && electedTerm == rf.currentTerm {
+				if rf.state == leader && t == rf.currentTerm {
 					replay := AppendEntriesReply{}
 					args := AppendEntriesArgs{
 						Term:         t,
@@ -848,7 +848,7 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 						// if the reply is no higher, simply release the lock, those reply means noting to leader
 						rf.mu.Unlock()
 					} else {
-						prettydebug.Debug(prettydebug.DWarn, "S%d send heartbeat to S%d failed, term: %d", rf.me, i, electedTerm)
+						prettydebug.Debug(prettydebug.DWarn, "S%d send heartbeat to S%d failed, term: %d", rf.me, i, t)
 					}
 				} else {
 					rf.mu.Unlock()
