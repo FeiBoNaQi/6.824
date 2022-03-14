@@ -59,12 +59,13 @@ type ApplyMsg struct {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	chMu      sync.Mutex          // lock to protect applyCh
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
-	dead      int32               // set by Kill()
+	applyReady chan bool
+	chMu       sync.Mutex          // lock to protect applyCh
+	mu         sync.Mutex          // Lock to protect shared access to this peer's state
+	peers      []*labrpc.ClientEnd // RPC end points of all peers
+	persister  *Persister          // Object to hold this peer's persisted state
+	me         int                 // this peer's index into peers[]
+	dead       int32               // set by Kill()
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -907,20 +908,50 @@ func (rf *Raft) sendHeartBeat(electedTerm int) {
 
 // must run with mutex held
 func (rf *Raft) applyLog() {
-	for rf.commitIndex > rf.lastApplied && !rf.killed() {
-		appMsg := ApplyMsg{
-			CommandValid: true,
-			Command:      rf.log[rf.lastApplied+1-rf.snapshotIndex],
-			CommandIndex: rf.lastApplied + 1, // command index start from 1 same as actual log start from 1
-		}
-		rf.lastApplied = rf.lastApplied + 1
-		rf.chMu.Lock()
-		rf.mu.Unlock()
-		rf.applyCh <- appMsg
-		rf.chMu.Unlock()
-		prettydebug.Debug(prettydebug.DLog, "S%d send log: %d to applyCh", rf.me, appMsg.Command)
-		rf.mu.Lock()
+	// for rf.commitIndex > rf.lastApplied && !rf.killed() {
+	// 	appMsg := ApplyMsg{
+	// 		CommandValid: true,
+	// 		Command:      rf.log[rf.lastApplied+1-rf.snapshotIndex],
+	// 		CommandIndex: rf.lastApplied + 1, // command index start from 1 same as actual log start from 1
+	// 	}
+	// 	rf.lastApplied = rf.lastApplied + 1
+	// 	rf.chMu.Lock()
+	// 	rf.mu.Unlock()
+	// 	rf.applyCh <- appMsg
+	// 	rf.chMu.Unlock()
+	// 	prettydebug.Debug(prettydebug.DLog, "S%d send log: %d to applyCh", rf.me, appMsg.Command)
+	// 	rf.mu.Lock()
+	// }
+	if !rf.killed() {
+		rf.applyReady <- true
 	}
+
+}
+
+func (rf *Raft) applyLogThread() {
+	rf.mu.Lock()
+	for !rf.killed() {
+		rf.mu.Unlock()
+		select {
+		case <-rf.applyReady:
+			rf.mu.Lock()
+			for rf.commitIndex > rf.lastApplied && !rf.killed() {
+				appMsg := ApplyMsg{
+					CommandValid: true,
+					Command:      rf.log[rf.lastApplied+1-rf.snapshotIndex],
+					CommandIndex: rf.lastApplied + 1, // command index start from 1 same as actual log start from 1
+				}
+				rf.lastApplied = rf.lastApplied + 1
+				rf.mu.Unlock()
+				rf.applyCh <- appMsg
+				prettydebug.Debug(prettydebug.DLog, "S%d send log: %d to applyCh", rf.me, appMsg.Command)
+				rf.mu.Lock()
+			}
+		case <-time.After(100 * time.Second):
+			rf.mu.Lock()
+		}
+	}
+	rf.mu.Unlock()
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
@@ -985,6 +1016,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = append(rf.log, 0)         // log[0] default to 0
 	rf.applyCh = applyCh
 	rf.snapshotIndex = 0
+	rf.applyReady = make(chan bool, 100)
 	rf.mu.Unlock()
 
 	// initialize from state persisted before a crash
@@ -992,6 +1024,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.applyLogThread()
 
 	return rf
 }
