@@ -378,6 +378,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					}
 				}
 				prettydebug.Debug(prettydebug.DClient, "S%d PrevLogIndex outbound existing log, log number: %d, rpc PrevLogIndex: %d, term: %d, MisMatchTermStartIndex:%d", rf.me, len(rf.logTerm), args.PrevLogIndex, rf.currentTerm, reply.MisMatchTermStartIndex)
+			} else if args.PrevLogIndex < rf.snapshotIndex {
+				reply.Success = false
+				reply.MisMatchTermStartIndex = len(rf.log) + rf.snapshotIndex
 			} else if rf.logTerm[args.PrevLogIndex-rf.snapshotIndex] != args.PrevLogTerm { // PrevLogTerm don't match
 				reply.Success = false
 				MisMatchTerm := rf.logTerm[args.PrevLogIndex-rf.snapshotIndex]
